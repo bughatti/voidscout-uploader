@@ -1,0 +1,5 @@
+dist/
+go.sum
+*.exe
+*.exe.old
+*.exe.new
