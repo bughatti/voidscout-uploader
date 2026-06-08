@@ -17,11 +17,15 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,44 +39,64 @@ const (
 	pollInterval   = 5 * time.Second // mtime polling — WoW atomic-replace defeats fsnotify on Windows
 	batchSize      = 100             // max fights per HTTP request
 
+	// Profile upload — uploaded on startup + periodic refresh.
+	// Server caps batches at 100 (MAX_PROFILES_PER_REQUEST in profile_endpoint.py).
+	profileBatchSize     = 50
+	profileLoopInterval  = 5 * time.Minute
+	profileStartupDelay  = 5 * time.Second
+	profileMaxAgeDays    = 30 // skip players we haven't seen in this many days
+
 	// Auto-update
 	updateRepo    = "bughatti/voidscout-uploader"   // public GitHub repo for releases
 	updateCheckTimeout = 10 * time.Second
-	currentVersion = "0.2.0"                         // bumped on each release; compared to GitHub
+	currentVersion = "0.3.1"                         // bumped on each release; compared to GitHub
+
+	// Combat log scan cadence — the addon auto-toggles /combatlog on
+	// encounter/run boundaries, so files appear and stabilize at that
+	// rhythm. 30s ticks comfortably catch stable files without thrashing.
+	combatLogScanInterval = 30 * time.Second
 )
 
 // ---- types matching the addon's SavedVariables shape ----
 
 type AddonFight struct {
-	EncounterID   int                `json:"encounter_id"`
-	EncounterName string             `json:"encounter_name"`
-	DifficultyID  int                `json:"difficulty_id"`
-	Outcome       string             `json:"outcome"`
-	DurationSec   int                `json:"duration_sec"`
-	Timestamp     int64              `json:"timestamp"`
-	PugID         string             `json:"pug_id"`
-	Class         string             `json:"class"`
-	Spec          string             `json:"spec"`
-	Uploaded      bool               `json:"uploaded"`
-	Axes          map[string]float64 `json:"axes"`
-	Roster        []string           `json:"roster"`
+	EncounterID   int                    `json:"encounter_id"`
+	EncounterName string                 `json:"encounter_name"`
+	DifficultyID  int                    `json:"difficulty_id"`
+	Outcome       string                 `json:"outcome"`
+	DurationSec   int                    `json:"duration_sec"`
+	Timestamp     int64                  `json:"timestamp"`
+	PugID         string                 `json:"pug_id"`
+	Class         string                 `json:"class"`
+	Spec          string                 `json:"spec"`
+	Mode          string                 `json:"mode"`           // "raid" | "mplus" | "dungeon"
+	Uploaded      bool                   `json:"uploaded"`
+	Axes          map[string]float64     `json:"axes"`
+	Roster        []string               `json:"roster"`
+	Raw           map[string]interface{} `json:"raw,omitempty"`         // dps, casts, avoidable_taken, etc — peer pool seed
+	RunID         string                 `json:"run_id,omitempty"`      // groups M+ pulls into one run-event
+	DataQuality   string                 `json:"data_quality,omitempty"` // "ok" or "stale" (DC/AFK/reset)
 }
 
 type IngestFight struct {
-	PlayerName    string             `json:"player_name"`
-	PlayerRealm   string             `json:"player_realm,omitempty"`
-	PlayerRegion  string             `json:"player_region,omitempty"`
-	PlayerClass   string             `json:"player_class,omitempty"`
-	PlayerSpec    string             `json:"player_spec,omitempty"`
-	EncounterID   int                `json:"encounter_id"`
-	EncounterName string             `json:"encounter_name"`
-	DifficultyID  int                `json:"difficulty_id"`
-	Outcome       string             `json:"outcome"`
-	DurationSec   int                `json:"duration_sec"`
-	Timestamp     int64              `json:"timestamp"`
-	PugID         string             `json:"pug_id,omitempty"`
-	Axes          map[string]float64 `json:"axes"`
-	Roster        []string           `json:"roster,omitempty"`
+	PlayerName    string                 `json:"player_name"`
+	PlayerRealm   string                 `json:"player_realm,omitempty"`
+	PlayerRegion  string                 `json:"player_region,omitempty"`
+	PlayerClass   string                 `json:"player_class,omitempty"`
+	PlayerSpec    string                 `json:"player_spec,omitempty"`
+	EncounterID   int                    `json:"encounter_id"`
+	EncounterName string                 `json:"encounter_name"`
+	DifficultyID  int                    `json:"difficulty_id"`
+	Outcome       string                 `json:"outcome"`
+	DurationSec   int                    `json:"duration_sec"`
+	Timestamp     int64                  `json:"timestamp"`
+	PugID         string                 `json:"pug_id,omitempty"`
+	Mode          string                 `json:"mode,omitempty"`   // "raid" | "mplus" | "dungeon"
+	Axes          map[string]float64     `json:"axes"`
+	Roster        []string               `json:"roster,omitempty"`
+	Raw           map[string]interface{} `json:"raw,omitempty"`
+	RunID         string                 `json:"run_id,omitempty"`
+	DataQuality   string                 `json:"data_quality,omitempty"`
 }
 
 type IngestPayload struct {
@@ -89,8 +113,48 @@ type IngestResponse struct {
 }
 
 type State struct {
-	LastUploadedTs int64  `json:"last_uploaded_ts"` // upload all fights with ts > this
-	Contributor    string `json:"contributor"`      // last-known uploading character
+	LastUploadedTs      int64           `json:"last_uploaded_ts"` // upload all fights with ts > this
+	Contributor         string          `json:"contributor"`      // last-known uploading character
+	UploadedCombatLogs  map[string]bool `json:"uploaded_combat_logs,omitempty"` // filename -> uploaded?
+	UploadedRealm       string          `json:"uploaded_realm,omitempty"`       // last-known realm
+	UploadedRegion      string          `json:"uploaded_region,omitempty"`      // last-known region
+}
+
+// ProfileUpload mirrors PlayerScan's per-player record shape — only the
+// fields the server cares about. Extras are dropped silently.
+type ProfileUpload struct {
+	Slug              string                    `json:"slug"`
+	Name              string                    `json:"name"`
+	Realm             string                    `json:"realm"`
+	RealmSlug         string                    `json:"realm_slug"`
+	Region            string                    `json:"region"`
+	Class             string                    `json:"class,omitempty"`
+	Race              string                    `json:"race,omitempty"`
+	Faction           string                    `json:"faction,omitempty"`
+	Level             int                       `json:"level,omitempty"`
+	Guild             string                    `json:"guild,omitempty"`
+	Ilvl              int                       `json:"ilvl,omitempty"`
+	Spec              string                    `json:"spec,omitempty"`
+	SpecID            int                       `json:"spec_id,omitempty"`
+	Achievements      map[string]bool           `json:"achievements,omitempty"`
+	BossKills         map[string]bool           `json:"boss_kills,omitempty"`
+	AchievementPoints int                       `json:"achievement_points,omitempty"`
+	RioScore          *float64                  `json:"rio_score,omitempty"`
+	RioScorePrev      *float64                  `json:"rio_score_prev,omitempty"`
+	Archon            map[string]map[string]any `json:"archon,omitempty"`
+	Sources           []string                  `json:"sources,omitempty"`
+	LastSeen          int64                     `json:"-"` // local-only for filter logic
+}
+
+type ProfileBatch struct {
+	SubmitterGUID string          `json:"submitter_guid"`
+	Profiles      []ProfileUpload `json:"profiles"`
+}
+
+type ProfileResponse struct {
+	Accepted int      `json:"accepted"`
+	Filtered int      `json:"filtered"`
+	Errors   []string `json:"errors"`
 }
 
 // ============================================================
@@ -294,6 +358,77 @@ func (w *syncWriter) Write(p []byte) (int, error) {
 
 // ---- main loop ----
 
+// pidFilePath returns the fixed location for our single-instance PID file.
+// Windows: %TEMP%\voidscout-uploader.pid (matches existing convention).
+func pidFilePath() string {
+	return filepath.Join(os.TempDir(), "voidscout-uploader.pid")
+}
+
+// isProcessAlive returns true if the given PID belongs to a running process
+// whose image name matches our uploader binary. Windows-specific (tasklist).
+// Returns false if PID is dead, name doesn't match, or check itself fails.
+func isProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if runtime.GOOS != "windows" {
+		// On Unix the existing flow doesn't run, but be safe: trust the PID
+		// is alive only if we can signal it (signal 0 = liveness check).
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			return false
+		}
+		// Sending nil/0 signal is the standard Unix liveness probe.
+		// On Windows this would terminate the process, so the runtime.GOOS
+		// guard above is critical.
+		return p.Signal(os.Signal(nil)) == nil
+	}
+	// Windows: shell out to tasklist. /fi "PID eq N" /fo csv /nh
+	out, err := exec.Command("tasklist", "/fi", "PID eq "+strconv.Itoa(pid),
+		"/fo", "csv", "/nh").Output()
+	if err != nil {
+		return false
+	}
+	// tasklist prints a tip line when no match; check for our image name.
+	s := strings.ToLower(string(out))
+	return strings.Contains(s, "voidscout-uploader")
+}
+
+// acquireSingleInstanceLock either returns nil (we're the only instance and
+// our PID is now written to disk) or an error describing the other instance.
+// Caller should defer releaseSingleInstanceLock on success.
+func acquireSingleInstanceLock() error {
+	pf := pidFilePath()
+	if data, err := os.ReadFile(pf); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+			if isProcessAlive(pid) {
+				return fmt.Errorf("another voidscout-uploader is already running (PID %d). "+
+					"Stop it first or wait for it to exit. PID file: %s", pid, pf)
+			}
+			// Stale PID file from a crashed/killed instance — overwrite.
+		}
+	}
+	myPID := os.Getpid()
+	if err := os.WriteFile(pf, []byte(strconv.Itoa(myPID)), 0o644); err != nil {
+		return fmt.Errorf("write PID file %s: %w", pf, err)
+	}
+	return nil
+}
+
+// releaseSingleInstanceLock deletes our PID file. Best-effort; safe to call
+// multiple times. Only removes the file if it still contains OUR pid (so we
+// don't stomp on a successor instance).
+func releaseSingleInstanceLock() {
+	pf := pidFilePath()
+	data, err := os.ReadFile(pf)
+	if err != nil {
+		return
+	}
+	if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid == os.Getpid() {
+		_ = os.Remove(pf)
+	}
+}
+
 func main() {
 	var (
 		apiBase  = flag.String("api", defaultAPIBase, "API base URL")
@@ -304,6 +439,19 @@ func main() {
 		noUpdate = flag.Bool("no-update", false, "Skip auto-update check on launch")
 	)
 	flag.Parse()
+
+	// Single-instance lock — prevents the duplicate-process race we hit
+	// when the launcher/scheduled-task spawned multiple uploaders that
+	// then competed to upload the same SavedVariables fights.
+	// One-shot mode (-once) is exempt: it parses a file and exits, doesn't
+	// daemon-poll, so multiple invocations don't race.
+	if *oncePath == "" {
+		if err := acquireSingleInstanceLock(); err != nil {
+			log.Printf("VoidScout Uploader: %v", err)
+			os.Exit(0) // exit 0 — duplicate isn't a failure, the other instance handles work
+		}
+		defer releaseSingleInstanceLock()
+	}
 
 	log.SetFlags(log.LstdFlags)
 	// Optional file logging — bypasses any shell-redirection buffering
@@ -350,7 +498,30 @@ func main() {
 	// Initial run
 	runOnce(svPath, *apiBase, state, statePath, *dryRun, *verbose)
 
-	// Watch
+	// Profile uploader runs in the background — independent of fight uploads.
+	// Reads VoidScoutDB.playerScan.players, pushes to /api/profile/batch,
+	// keeps track of which slugs were last uploaded so we only re-send when
+	// the addon refreshed a player's data. Strictly outbound — server never
+	// gets queried back. See voidscout-data-direction memory.
+	go runProfileLoop(svPath, *apiBase, *dryRun, *verbose)
+
+	// Combat log file watcher — independent of fight + profile loops.
+	// Polls Logs/WoWCombatLog-*.txt periodically, uploads any new stable
+	// (60s+ idle) file to /api/upload-log. State persisted to avoid
+	// re-uploading the same file twice.
+	go func() {
+		// Brief startup delay so the initial runOnce can populate
+		// state.Contributor before the first scan.
+		time.Sleep(10 * time.Second)
+		ticker := time.NewTicker(combatLogScanInterval)
+		defer ticker.Stop()
+		for {
+			scanCombatLogs(*apiBase, state, statePath, *dryRun, *verbose)
+			<-ticker.C
+		}
+	}()
+
+	// Watch (blocking)
 	watch(svPath, func() {
 		runOnce(svPath, *apiBase, state, statePath, *dryRun, *verbose)
 	})
@@ -531,9 +702,13 @@ func parseSavedVars(path string) (map[string][]AddonFight, string, error) {
 				PugID:         strField(ft, "pug_id"),
 				Class:         strField(ft, "class"),
 				Spec:          strField(ft, "spec"),
+				Mode:          strField(ft, "mode"),
 				Uploaded:      boolField(ft, "uploaded"),
 				Axes:          axesField(ft, "axes"),
 				Roster:        stringListField(ft, "roster"),
+				Raw:           rawField(ft, "raw"),
+				RunID:         strField(ft, "run_id"),
+				DataQuality:   strField(ft, "data_quality"),
 			}
 			list = append(list, af)
 		})
@@ -611,6 +786,29 @@ func axesField(t *lua.LTable, key string) map[string]float64 {
 	return out
 }
 
+// rawField extracts the heterogeneous `raw = {...}` block per fight: damage_done,
+// dps, casts, avoidable_taken, died, class — mix of numbers/strings/bools.
+// Stored server-side as JSONB for peer-pool aggregation queries.
+func rawField(t *lua.LTable, key string) map[string]interface{} {
+	v := t.RawGetString(key)
+	if v.Type() != lua.LTTable {
+		return nil
+	}
+	out := make(map[string]interface{})
+	v.(*lua.LTable).ForEach(func(k, val lua.LValue) {
+		ks := k.String()
+		switch val.Type() {
+		case lua.LTNumber:
+			out[ks] = float64(val.(lua.LNumber))
+		case lua.LTString:
+			out[ks] = string(val.(lua.LString))
+		case lua.LTBool:
+			out[ks] = bool(val.(lua.LBool))
+		}
+	})
+	return out
+}
+
 // ---- pending logic ----
 
 // filterPending returns one IngestFight per (player, fight) where the
@@ -636,8 +834,12 @@ func filterPending(byName map[string][]AddonFight, lastTs int64) []IngestFight {
 				DurationSec:   f.DurationSec,
 				Timestamp:     f.Timestamp,
 				PugID:         f.PugID,
+				Mode:          f.Mode,
 				Axes:          f.Axes,
 				Roster:        f.Roster,
+				Raw:           f.Raw,
+				RunID:         f.RunID,
+				DataQuality:   f.DataQuality,
 			})
 		}
 	}
@@ -746,4 +948,567 @@ func watch(svPath string, onChange func()) {
 		lastSize = st.Size()
 		onChange()
 	}
+}
+
+// ============================================================
+// Profile uploader — outbound-only push of VoidScoutDB.playerScan.players
+// to /api/profile/batch. Runs at startup (after a short delay) + every 15
+// minutes. NEVER queries the server back — strictly upload. See the
+// voidscout-data-direction memory.
+//
+// Per-slug skip set tracks the last_seen timestamp we pushed for each
+// profile; we re-upload only when the addon refreshed a player's data.
+// ============================================================
+
+// runProfileLoop is the long-lived goroutine. svPath/apiBase/etc captured
+// from main(). The skip-set lives in memory only (no persistence) — losing
+// it on restart just means one extra full upload, which is fine.
+func runProfileLoop(svPath, apiBase string, dryRun, verbose bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("profile: goroutine panic: %v", r)
+		}
+	}()
+
+	// Tiny startup delay so the fight upload + auto-update have settled.
+	time.Sleep(profileStartupDelay)
+
+	lastUploadedLastSeen := make(map[string]int64) // slug → last_seen we pushed
+	for {
+		runProfileBatch(svPath, apiBase, lastUploadedLastSeen, dryRun, verbose)
+		time.Sleep(profileLoopInterval)
+	}
+}
+
+func runProfileBatch(svPath, apiBase string, lastUploadedLastSeen map[string]int64, dryRun, verbose bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("profile: batch panic: %v", r)
+		}
+	}()
+
+	profiles, submitterGUID, err := parseProfiles(svPath)
+	if err != nil {
+		log.Printf("profile: parse error: %v", err)
+		return
+	}
+	if len(profiles) == 0 {
+		if verbose {
+			log.Printf("profile: no profiles in SavedVars yet")
+		}
+		return
+	}
+	if submitterGUID == "" {
+		// We can still upload without it — server just records empty
+		// contributor_guids — but log so we notice.
+		if verbose {
+			log.Printf("profile: no self GUID found; uploading anonymously")
+		}
+	}
+
+	// Filter: drop stale + sub-cap + un-changed-since-last-upload
+	now := time.Now().Unix()
+	maxAge := int64(profileMaxAgeDays) * 86400
+	var pending []ProfileUpload
+	var (
+		skippedLevel   int
+		skippedStale   int
+		skippedNoSlug  int
+		skippedNoChange int
+	)
+	for _, p := range profiles {
+		if p.Slug == "" {
+			skippedNoSlug++
+			continue
+		}
+		if p.Level > 0 && p.Level < 80 {
+			skippedLevel++
+			continue
+		}
+		if p.LastSeen > 0 && (now-p.LastSeen) > maxAge {
+			skippedStale++
+			continue
+		}
+		// Re-upload only when the addon's last_seen advanced past what we sent.
+		if prev, ok := lastUploadedLastSeen[p.Slug]; ok && p.LastSeen > 0 && p.LastSeen <= prev {
+			skippedNoChange++
+			continue
+		}
+		pending = append(pending, p)
+	}
+	if len(pending) == 0 {
+		if verbose {
+			log.Printf("profile: nothing new to upload (total=%d, lvl=%d stale=%d noSlug=%d noChange=%d)",
+				len(profiles), skippedLevel, skippedStale, skippedNoSlug, skippedNoChange)
+		}
+		return
+	}
+
+	log.Printf("profile: uploading %d/%d (lvl=%d stale=%d noSlug=%d noChange=%d) as %q",
+		len(pending), len(profiles), skippedLevel, skippedStale, skippedNoSlug, skippedNoChange, submitterGUID)
+
+	if dryRun {
+		for _, p := range pending {
+			log.Printf("  [DRY] %s lvl=%d ilvl=%d rio=%v", p.Slug, p.Level, p.Ilvl, p.RioScore)
+		}
+		return
+	}
+
+	for i := 0; i < len(pending); i += profileBatchSize {
+		end := i + profileBatchSize
+		if end > len(pending) {
+			end = len(pending)
+		}
+		batch := pending[i:end]
+		resp, err := uploadProfileBatch(apiBase, submitterGUID, batch)
+		if err != nil {
+			log.Printf("profile: batch %d-%d failed: %v", i, end, err)
+			// Don't advance lastUploadedLastSeen for this batch — try again next loop.
+			continue
+		}
+		log.Printf("profile: batch %d-%d accepted=%d filtered=%d errors=%v",
+			i, end, resp.Accepted, resp.Filtered, resp.Errors)
+		for _, p := range batch {
+			if p.LastSeen > 0 {
+				lastUploadedLastSeen[p.Slug] = p.LastSeen
+			} else {
+				// No last_seen → mark with current unix time so we don't
+				// re-upload until the addon re-touches it.
+				lastUploadedLastSeen[p.Slug] = now
+			}
+		}
+	}
+}
+
+// parseProfiles loads VoidScout.lua, walks VoidScoutDB.playerScan.players,
+// and converts each table to a ProfileUpload. Returns the slice + the
+// submitter's GUID (the player marked is_self=true).
+func parseProfiles(path string) ([]ProfileUpload, string, error) {
+	L := lua.NewState()
+	defer L.Close()
+	if err := L.DoFile(path); err != nil {
+		return nil, "", fmt.Errorf("execute lua: %w", err)
+	}
+	db := L.GetGlobal("VoidScoutDB")
+	if db.Type() != lua.LTTable {
+		return nil, "", fmt.Errorf("VoidScoutDB is not a table")
+	}
+	playerScan := db.(*lua.LTable).RawGetString("playerScan")
+	if playerScan.Type() != lua.LTTable {
+		// Older addon SavedVars before PlayerScan module — not an error,
+		// just nothing to upload.
+		return nil, "", nil
+	}
+	players := playerScan.(*lua.LTable).RawGetString("players")
+	if players.Type() != lua.LTTable {
+		return nil, "", nil
+	}
+
+	var out []ProfileUpload
+	var submitterGUID string
+	players.(*lua.LTable).ForEach(func(guidVal, pdata lua.LValue) {
+		if pdata.Type() != lua.LTTable {
+			return
+		}
+		t := pdata.(*lua.LTable)
+		isSelf := boolField(t, "is_self")
+		guid := ""
+		if s, ok := guidVal.(lua.LString); ok {
+			guid = string(s)
+		}
+		if isSelf && submitterGUID == "" {
+			submitterGUID = guid
+		}
+
+		p := ProfileUpload{
+			Slug:              strField(t, "slug"),
+			Name:              strField(t, "name"),
+			Realm:             strField(t, "realm"),
+			RealmSlug:         strField(t, "realm_slug"),
+			Region:            strField(t, "region"),
+			Class:             strField(t, "class"),
+			Race:              strField(t, "race"),
+			Faction:           strField(t, "faction"),
+			Level:             intField(t, "level"),
+			Guild:             strField(t, "guild"),
+			Ilvl:              intField(t, "ilvl"),
+			Spec:              strField(t, "spec"),
+			SpecID:            intField(t, "spec_id"),
+			AchievementPoints: intField(t, "achievement_points"),
+			Achievements:      truthyMapField(t, "achievements"),
+			BossKills:         truthyMapField(t, "boss_kills"),
+			Archon:            archonField(t, "archon"),
+			LastSeen:          int64(intField(t, "last_seen")),
+		}
+		if rio := floatPtrField(t, "rio_score"); rio != nil {
+			p.RioScore = rio
+		}
+		if rioPrev := floatPtrField(t, "rio_score_prev"); rioPrev != nil {
+			p.RioScorePrev = rioPrev
+		}
+		// Source attribution — tells the website where this came from
+		var sources []string
+		sources = append(sources, "scan")
+		if _, ok := t.RawGetString("rio_score").(lua.LNumber); ok {
+			sources = append(sources, "rio_local")
+		}
+		if t.RawGetString("archon").Type() == lua.LTTable {
+			sources = append(sources, "archon_local")
+		}
+		p.Sources = sources
+
+		out = append(out, p)
+	})
+
+	return out, submitterGUID, nil
+}
+
+// truthyMapField pulls a {key = true} table into a Go map. Skips false / nil
+// values so the server-side set-union doesn't get smashed by false.
+func truthyMapField(t *lua.LTable, key string) map[string]bool {
+	v := t.RawGetString(key)
+	if v.Type() != lua.LTTable {
+		return nil
+	}
+	out := make(map[string]bool)
+	v.(*lua.LTable).ForEach(func(k, val lua.LValue) {
+		if b, ok := val.(lua.LBool); ok && bool(b) {
+			if ks, ok2 := k.(lua.LString); ok2 {
+				out[string(ks)] = true
+			}
+		}
+	})
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// archonField unpacks p.archon = { N={...}, H={...}, M={...} } where each
+// inner table has {progress, total, avg, asp, rank, encounters}.
+func archonField(t *lua.LTable, key string) map[string]map[string]any {
+	v := t.RawGetString(key)
+	if v.Type() != lua.LTTable {
+		return nil
+	}
+	out := make(map[string]map[string]any)
+	v.(*lua.LTable).ForEach(func(k, val lua.LValue) {
+		ks, ok := k.(lua.LString)
+		if !ok {
+			return
+		}
+		if val.Type() != lua.LTTable {
+			return
+		}
+		diffKey := string(ks)
+		inner := make(map[string]any)
+		val.(*lua.LTable).ForEach(func(fk, fv lua.LValue) {
+			fks, ok := fk.(lua.LString)
+			if !ok {
+				return
+			}
+			fieldName := string(fks)
+			switch fieldName {
+			case "progress", "total", "avg", "asp", "rank":
+				if n, ok := fv.(lua.LNumber); ok {
+					inner[fieldName] = float64(n)
+				}
+			case "encounters":
+				// Pass through as nested map: { encID: { kills, best } }
+				if fv.Type() == lua.LTTable {
+					enc := make(map[string]map[string]float64)
+					fv.(*lua.LTable).ForEach(func(eid, edata lua.LValue) {
+						if edata.Type() != lua.LTTable {
+							return
+						}
+						idStr := ""
+						if n, ok := eid.(lua.LNumber); ok {
+							idStr = fmt.Sprintf("%d", int(n))
+						} else if s, ok := eid.(lua.LString); ok {
+							idStr = string(s)
+						}
+						if idStr == "" {
+							return
+						}
+						ed := make(map[string]float64)
+						edata.(*lua.LTable).ForEach(func(efk, efv lua.LValue) {
+							if efks, ok := efk.(lua.LString); ok {
+								if n, ok := efv.(lua.LNumber); ok {
+									ed[string(efks)] = float64(n)
+								}
+							}
+						})
+						if len(ed) > 0 {
+							enc[idStr] = ed
+						}
+					})
+					if len(enc) > 0 {
+						inner["encounters"] = enc
+					}
+				}
+			}
+		})
+		if len(inner) > 0 {
+			out[diffKey] = inner
+		}
+	})
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// floatPtrField returns a pointer so we can distinguish "missing" from
+// "explicitly zero" — required because RioScore = nil should NOT clobber
+// an existing server-side value via COALESCE.
+func floatPtrField(t *lua.LTable, key string) *float64 {
+	v := t.RawGetString(key)
+	if n, ok := v.(lua.LNumber); ok {
+		f := float64(n)
+		return &f
+	}
+	return nil
+}
+
+func uploadProfileBatch(apiBase, submitterGUID string, batch []ProfileUpload) (*ProfileResponse, error) {
+	payload := ProfileBatch{
+		SubmitterGUID: submitterGUID,
+		Profiles:      batch,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("POST", apiBase+"/api/profile/batch", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "VoidScoutUploader/"+currentVersion)
+	client := &http.Client{Timeout: 30 * time.Second}
+	httpResp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", httpResp.StatusCode)
+	}
+	var resp ProfileResponse
+	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &resp, nil
+}
+
+// =================================================================
+// COMBAT LOG FILE WATCHER (Phase 2 — addon auto-toggles /combatlog;
+// uploader detects new files and POSTs them to /api/upload-log).
+// =================================================================
+
+// detectLogsDirs returns Logs/ directories under all detected WoW installs.
+// Each install has Logs/ as a sibling of WTF/. We watch all of them.
+func detectLogsDirs() []string {
+	var dirs []string
+	for _, install := range wowInstallPaths() {
+		logs := filepath.Join(install, "Logs")
+		if st, err := os.Stat(logs); err == nil && st.IsDir() {
+			dirs = append(dirs, logs)
+		}
+	}
+	return dirs
+}
+
+// combatLogStable is the quiet period after which we consider a combat log
+// file "done writing." WoW only stops writing when /combatlog is disabled;
+// our addon disables on encounter/run end, so 60s of no activity is safe.
+const combatLogStable = 60 * time.Second
+
+// combatLogMaxBytes mirrors the server's MAX_UPLOAD_BYTES (200 MB). Files
+// larger than this are skipped with a warning — the server would reject
+// them anyway. Future improvement: split by ENCOUNTER_START markers.
+const combatLogMaxBytes = int64(200 * 1024 * 1024)
+
+// scanCombatLogs walks all detected Logs directories, identifies stable
+// (no-recent-writes) WoWCombatLog-*.txt files we haven't uploaded yet,
+// and POSTs each one to /api/upload-log. State is persisted after each
+// successful upload so we never re-send.
+func scanCombatLogs(apiBase string, state *State, statePath string, dryRun, verbose bool) {
+	if state.Contributor == "" {
+		if verbose {
+			log.Printf("combatlog: no Contributor yet, skipping scan")
+		}
+		return
+	}
+	playerName, playerRealm := splitContributor(state.Contributor)
+	if playerName == "" {
+		if verbose {
+			log.Printf("combatlog: cannot parse Contributor %q", state.Contributor)
+		}
+		return
+	}
+	if playerRealm == "" {
+		playerRealm = state.UploadedRealm
+	}
+	playerRegion := state.UploadedRegion
+	if playerRegion == "" {
+		playerRegion = "us"
+	}
+
+	dirs := detectLogsDirs()
+	if len(dirs) == 0 {
+		if verbose {
+			log.Printf("combatlog: no WoW Logs/ directory found")
+		}
+		return
+	}
+
+	now := time.Now()
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			log.Printf("combatlog: read %s: %v", dir, err)
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if !strings.HasPrefix(name, "WoWCombatLog-") || !strings.HasSuffix(name, ".txt") {
+				continue
+			}
+			full := filepath.Join(dir, name)
+			if state.UploadedCombatLogs[full] {
+				continue
+			}
+			st, err := os.Stat(full)
+			if err != nil {
+				continue
+			}
+			if st.Size() == 0 {
+				continue
+			}
+			if st.Size() > combatLogMaxBytes {
+				log.Printf("combatlog: SKIP %s (%.1f MB > %d MB cap)",
+					name, float64(st.Size())/1024/1024, combatLogMaxBytes/1024/1024)
+				// Mark uploaded so we don't keep re-checking it
+				if state.UploadedCombatLogs == nil {
+					state.UploadedCombatLogs = map[string]bool{}
+				}
+				state.UploadedCombatLogs[full] = true
+				saveState(state, statePath)
+				continue
+			}
+			if now.Sub(st.ModTime()) < combatLogStable {
+				if verbose {
+					log.Printf("combatlog: %s still being written (last write %ds ago)",
+						name, int(now.Sub(st.ModTime()).Seconds()))
+				}
+				continue
+			}
+
+			if dryRun {
+				log.Printf("combatlog: [DRY] would upload %s (%.1f MB) as %s-%s-%s",
+					name, float64(st.Size())/1024/1024, playerName, playerRealm, playerRegion)
+				continue
+			}
+
+			log.Printf("combatlog: uploading %s (%.1f MB)...",
+				name, float64(st.Size())/1024/1024)
+			if err := uploadCombatLog(apiBase, full, playerName, playerRealm, playerRegion, verbose); err != nil {
+				log.Printf("combatlog: UPLOAD FAILED %s: %v", name, err)
+				continue
+			}
+			if state.UploadedCombatLogs == nil {
+				state.UploadedCombatLogs = map[string]bool{}
+			}
+			state.UploadedCombatLogs[full] = true
+			saveState(state, statePath)
+			log.Printf("combatlog: uploaded %s", name)
+		}
+	}
+}
+
+// uploadCombatLog POSTs a single file via multipart/form-data to
+// /api/upload-log. The server parses, validates, scores, and ingests
+// per upload_log_endpoint.py.
+//
+// IMPORTANT: We read the file fully into memory BEFORE opening the HTTP
+// request, so the OS file handle is released within milliseconds. Without
+// this, a slow or retried upload holds the handle for the entire transfer
+// duration, which on Windows blocks `move`, `del`, and even `mv` from
+// other processes ("file is being used by another process"). The 200MB
+// upload cap means worst-case memory is 200MB, fine on any modern PC.
+func uploadCombatLog(apiBase, path, playerName, playerRealm, playerRegion string, verbose bool) error {
+	// Buffer the file content into memory first, then close the handle.
+	fileBytes, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	if err := mw.WriteField("character_name", playerName); err != nil {
+		return err
+	}
+	if err := mw.WriteField("realm", playerRealm); err != nil {
+		return err
+	}
+	if err := mw.WriteField("region", playerRegion); err != nil {
+		return err
+	}
+	part, err := mw.CreateFormFile("file", filepath.Base(path))
+	if err != nil {
+		return fmt.Errorf("create form file: %w", err)
+	}
+	if _, err := part.Write(fileBytes); err != nil {
+		return fmt.Errorf("write file body: %w", err)
+	}
+	if err := mw.Close(); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", apiBase+"/api/upload-log", &body)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("User-Agent", fmt.Sprintf("voidscout-uploader/%s", currentVersion))
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 300))
+	}
+	if verbose {
+		log.Printf("combatlog: server response: %s", truncate(string(respBody), 300))
+	}
+	return nil
+}
+
+// splitContributor splits "Name-Realm" or "Name-Realm-Region" into parts.
+// Returns name + realm (region handled separately).
+func splitContributor(s string) (name, realm string) {
+	if s == "" {
+		return "", ""
+	}
+	parts := strings.Split(s, "-")
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], parts[1]
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
