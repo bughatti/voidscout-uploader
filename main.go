@@ -49,12 +49,17 @@ const (
 	// Auto-update
 	updateRepo    = "bughatti/voidscout-uploader"   // public GitHub repo for releases
 	updateCheckTimeout = 10 * time.Second
-	currentVersion = "0.3.1"                         // bumped on each release; compared to GitHub
+	currentVersion = "0.4.0"                         // bumped on each release; compared to GitHub
 
 	// Combat log scan cadence — the addon auto-toggles /combatlog on
 	// encounter/run boundaries, so files appear and stabilize at that
 	// rhythm. 30s ticks comfortably catch stable files without thrashing.
 	combatLogScanInterval = 30 * time.Second
+
+	// VRT Session Recorder scan cadence. Lighter than combat logs since
+	// sessions are smaller (one JSON-shaped table per encounter).
+	sessionScanInterval = 60 * time.Second
+	sessionStartupDelay = 15 * time.Second
 )
 
 // ---- types matching the addon's SavedVariables shape ----
@@ -112,12 +117,35 @@ type IngestResponse struct {
 	SkipReasons    map[string]int `json:"skip_reasons"`
 }
 
+// CombatLogRetry tracks backoff state for a single combat log file. Persisted
+// so the uploader can't burn the daily rate limit by retrying every 30s
+// across a process restart. On 200 the entry is cleared and the file is
+// added to UploadedCombatLogs.
+type CombatLogRetry struct {
+	NextEligibleUnix int64  `json:"next_eligible_unix"` // skip the file until this wall time
+	AttemptCount     int    `json:"attempt_count"`      // 1, 2, 3, ... — fed into backoff
+	LastErrorCode    int    `json:"last_error_code"`    // most-recent HTTP code (or 0 for transport error)
+	LastErrorAt      int64  `json:"last_error_at"`      // unix ts of most recent attempt
+	LastErrorMsg     string `json:"last_error_msg,omitempty"`
+}
+
 type State struct {
 	LastUploadedTs      int64           `json:"last_uploaded_ts"` // upload all fights with ts > this
 	Contributor         string          `json:"contributor"`      // last-known uploading character
 	UploadedCombatLogs  map[string]bool `json:"uploaded_combat_logs,omitempty"` // filename -> uploaded?
 	UploadedRealm       string          `json:"uploaded_realm,omitempty"`       // last-known realm
 	UploadedRegion      string          `json:"uploaded_region,omitempty"`      // last-known region
+	// Per-file retry state. Empty/missing entries mean "go ahead and try."
+	CombatLogRetry      map[string]*CombatLogRetry `json:"combat_log_retry,omitempty"`
+	// VRT Session Recorder uploads — session_id -> uploaded? Tracked here
+	// so we don't re-POST the same session if the addon's pending_uploads
+	// queue keeps it around (the addon can't drop entries without /reload).
+	UploadedSessions    map[string]bool `json:"uploaded_sessions,omitempty"`
+	// Opt-out request — last requested_at we've successfully POSTed to
+	// /api/opt-out. The addon writes VoidScoutDB.opt_out_requested when
+	// the user clicks the "Delete + go local" button; the uploader picks
+	// it up on next run and POSTs the deletion request to the server.
+	LastOptOutTs        int64           `json:"last_opt_out_ts,omitempty"`
 }
 
 // ProfileUpload mirrors PlayerScan's per-player record shape — only the
@@ -356,6 +384,238 @@ func (w *syncWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// ---- VRT Session Recorder upload ----
+//
+// Reads VoidRaidToolsReader.lua, walks VoidRaidToolsReaderDB.pending_uploads,
+// JSONifies each export-shaped payload, POSTs to /api/v1/sessions/upload.
+// Tracks uploaded session_ids in state.UploadedSessions so we don't double-
+// post entries that haven't rolled off the addon's cap-20 queue yet.
+
+// detectVRTReaderSavedVarsPath finds VoidRaidToolsReader.lua under the
+// same WoW install hierarchy as VoidScout.lua. Returns most-recently-
+// modified candidate.
+func detectVRTReaderSavedVarsPath() (string, error) {
+	candidates := wowAccountRoots()
+	var best string
+	var bestMtime time.Time
+	for _, root := range candidates {
+		path := filepath.Join(root, "SavedVariables", "VoidRaidToolsReader.lua")
+		st, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if best == "" || st.ModTime().After(bestMtime) {
+			best = path
+			bestMtime = st.ModTime()
+		}
+	}
+	if best == "" {
+		return "", fmt.Errorf("no VoidRaidToolsReader.lua found under any of %d candidate WoW installs", len(candidates))
+	}
+	return best, nil
+}
+
+// luaTableToMap walks a *lua.LTable and produces a JSON-friendly
+// map[string]interface{}. Lists with sequential int keys become []interface{}.
+// Used for session payloads where event/aura array entries are polymorphic.
+func luaValueToInterface(v lua.LValue) interface{} {
+	switch x := v.(type) {
+	case lua.LNumber:
+		f := float64(x)
+		if f == float64(int64(f)) {
+			return int64(f)
+		}
+		return f
+	case lua.LString:
+		return string(x)
+	case lua.LBool:
+		return bool(x)
+	case *lua.LTable:
+		return luaTableToInterface(x)
+	case *lua.LNilType:
+		return nil
+	}
+	return nil
+}
+
+func luaTableToInterface(t *lua.LTable) interface{} {
+	if t == nil {
+		return nil
+	}
+	// Detect array-shape: 1..N integer keys, nothing else.
+	isArray := true
+	maxIdx := 0
+	keyCount := 0
+	t.ForEach(func(k, _ lua.LValue) {
+		keyCount++
+		if n, ok := k.(lua.LNumber); ok {
+			i := int(n)
+			if float64(i) == float64(n) && i >= 1 {
+				if i > maxIdx {
+					maxIdx = i
+				}
+				return
+			}
+		}
+		isArray = false
+	})
+	if isArray && keyCount == maxIdx && keyCount > 0 {
+		out := make([]interface{}, maxIdx)
+		t.ForEach(func(k, v lua.LValue) {
+			if n, ok := k.(lua.LNumber); ok {
+				out[int(n)-1] = luaValueToInterface(v)
+			}
+		})
+		return out
+	}
+	out := make(map[string]interface{})
+	t.ForEach(func(k, v lua.LValue) {
+		out[k.String()] = luaValueToInterface(v)
+	})
+	return out
+}
+
+// parseVRTReaderSessions returns the pending_uploads list from the
+// SavedVariables file. Each entry has {queued_ts, status, payload}.
+// We only care about payload (the export-shaped session).
+func parseVRTReaderSessions(path string) ([]map[string]interface{}, error) {
+	L := lua.NewState()
+	defer L.Close()
+	if err := L.DoFile(path); err != nil {
+		return nil, fmt.Errorf("execute lua: %w", err)
+	}
+	db := L.GetGlobal("VoidRaidToolsReaderDB")
+	if db.Type() != lua.LTTable {
+		return nil, nil // file exists but no addon DB (first launch)
+	}
+	queue := db.(*lua.LTable).RawGetString("pending_uploads")
+	if queue.Type() != lua.LTTable {
+		return nil, nil
+	}
+	var out []map[string]interface{}
+	queue.(*lua.LTable).ForEach(func(_, entry lua.LValue) {
+		if entry.Type() != lua.LTTable {
+			return
+		}
+		payload := entry.(*lua.LTable).RawGetString("payload")
+		if payload.Type() != lua.LTTable {
+			return
+		}
+		m, ok := luaTableToInterface(payload.(*lua.LTable)).(map[string]interface{})
+		if !ok {
+			return
+		}
+		out = append(out, m)
+	})
+	return out, nil
+}
+
+// uploadSession POSTs a single session payload as JSON to the server.
+// Returns the HTTP status code + any error.
+func uploadSession(apiBase string, payload map[string]interface{}, contributor string) (int, error) {
+	body, err := json.Marshal(map[string]interface{}{
+		"contributor": contributor,
+		"session":     payload,
+	})
+	if err != nil {
+		return 0, err
+	}
+	url := strings.TrimRight(apiBase, "/") + "/api/v1/sessions/upload"
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "voidscout-uploader/"+currentVersion)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, fmt.Errorf("server: %s", string(b))
+	}
+	return resp.StatusCode, nil
+}
+
+// scanSessions reads the Reader SavedVariables, finds pending sessions
+// the server hasn't seen, uploads them. Called from a periodic loop.
+func scanSessions(apiBase string, state *State, statePath string, dryRun, verbose bool) {
+	path, err := detectVRTReaderSavedVarsPath()
+	if err != nil {
+		if verbose {
+			log.Printf("session-scan: %v", err)
+		}
+		return
+	}
+	sessions, err := parseVRTReaderSessions(path)
+	if err != nil {
+		log.Printf("session-scan: parse error: %v", err)
+		return
+	}
+	if len(sessions) == 0 {
+		if verbose {
+			log.Printf("session-scan: queue empty")
+		}
+		return
+	}
+	if state.UploadedSessions == nil {
+		state.UploadedSessions = make(map[string]bool)
+	}
+	var sent, skipped, failed int
+	for _, payload := range sessions {
+		sid, _ := payload["session_id"].(string)
+		if sid == "" {
+			continue
+		}
+		if state.UploadedSessions[sid] {
+			skipped++
+			continue
+		}
+		if dryRun {
+			log.Printf("session-scan: [dry-run] would upload session %s (label=%v encounter=%v)",
+				sid, payload["label"], payload["encounter"])
+			sent++
+			continue
+		}
+		status, err := uploadSession(apiBase, payload, state.Contributor)
+		if err != nil {
+			failed++
+			log.Printf("session-scan: upload %s failed (status=%d): %v", sid, status, err)
+			continue
+		}
+		state.UploadedSessions[sid] = true
+		sent++
+		if verbose {
+			log.Printf("session-scan: uploaded %s (status=%d)", sid, status)
+		}
+	}
+	if sent > 0 || failed > 0 {
+		log.Printf("session-scan: %d uploaded, %d skipped (already sent), %d failed",
+			sent, skipped, failed)
+		if err := saveState(state, statePath); err != nil {
+			log.Printf("session-scan: save state failed: %v", err)
+		}
+	}
+	// Cap the UploadedSessions map so it doesn't grow unbounded over months
+	// of sessions. The addon's queue is capped at 20, so we only need to
+	// remember the last few hundred to safely skip duplicates.
+	if len(state.UploadedSessions) > 500 {
+		// Naive: drop random half. We don't track insertion order; the cost
+		// of re-uploading a single stale entry is just one extra POST.
+		dropped := 0
+		for k := range state.UploadedSessions {
+			delete(state.UploadedSessions, k)
+			dropped++
+			if dropped >= 250 {
+				break
+			}
+		}
+	}
+}
+
 // ---- main loop ----
 
 // pidFilePath returns the fixed location for our single-instance PID file.
@@ -521,6 +781,19 @@ func main() {
 		}
 	}()
 
+	// VRT Session Recorder uploader — polls VoidRaidToolsReader.lua's
+	// pending_uploads queue, posts each session to /api/v1/sessions/upload.
+	// Independent of other loops; survives addon/file mismatches silently.
+	go func() {
+		time.Sleep(sessionStartupDelay)
+		ticker := time.NewTicker(sessionScanInterval)
+		defer ticker.Stop()
+		for {
+			scanSessions(*apiBase, state, statePath, *dryRun, *verbose)
+			<-ticker.C
+		}
+	}()
+
 	// Watch (blocking)
 	watch(svPath, func() {
 		runOnce(svPath, *apiBase, state, statePath, *dryRun, *verbose)
@@ -529,6 +802,18 @@ func main() {
 
 // runOnce reads the file, finds pending fights, uploads them, persists state.
 func runOnce(svPath, apiBase string, state *State, statePath string, dryRun, verbose bool) {
+	// Opt-out runs FIRST so even if all other uploads fail (e.g. server
+	// down for fights but reachable for the small opt-out POST), the
+	// user's deletion request still goes through. Persists state at the
+	// end of the function so a successful opt-out is recorded.
+	if !dryRun {
+		checkAndSendOptOut(svPath, apiBase, state)
+		// Also check the VRTReader SV — the addon writes the same flag.
+		if vrtPath, _ := detectVRTReaderSavedVarsPath(); vrtPath != "" {
+			checkAndSendOptOut(vrtPath, apiBase, state)
+		}
+	}
+
 	fights, contributor, err := parseSavedVars(svPath)
 	if err != nil {
 		log.Printf("parse error: %v", err)
@@ -661,6 +946,110 @@ func wowInstallPaths() []string {
 // parseSavedVars loads VoidScout.lua in an embedded Lua interpreter and
 // pulls out VoidScoutDB.scores[<name>].fights[] into Go structs.
 // Returns: per-player fights map, contributor name (the uploading character).
+// OptOutRequest mirrors VoidScoutDB.opt_out_requested in SavedVariables.
+// Written by the in-addon "Delete + go local" buttons in VoidScout's and
+// VRTReader's consent dialogs. Drained by checkAndSendOptOut().
+type OptOutRequest struct {
+	Name         string
+	Realm        string
+	Region       string
+	RequestedAt  int64
+	Source       string
+}
+
+// parseOptOutRequest reads VoidScoutDB.opt_out_requested from any
+// SavedVariables file that contains a VoidScoutDB global. Returns nil
+// if no request is present (typical case).
+func parseOptOutRequest(path string) (*OptOutRequest, error) {
+	L := lua.NewState()
+	defer L.Close()
+	if err := L.DoFile(path); err != nil {
+		return nil, fmt.Errorf("execute lua: %w", err)
+	}
+	db := L.GetGlobal("VoidScoutDB")
+	if db.Type() != lua.LTTable {
+		return nil, nil
+	}
+	oo := db.(*lua.LTable).RawGetString("opt_out_requested")
+	if oo.Type() != lua.LTTable {
+		return nil, nil
+	}
+	t := oo.(*lua.LTable)
+	get := func(k string) string {
+		v := t.RawGetString(k)
+		if s, ok := v.(lua.LString); ok {
+			return string(s)
+		}
+		return ""
+	}
+	getInt := func(k string) int64 {
+		v := t.RawGetString(k)
+		if n, ok := v.(lua.LNumber); ok {
+			return int64(n)
+		}
+		return 0
+	}
+	req := &OptOutRequest{
+		Name:        get("name"),
+		Realm:       get("realm"),
+		Region:      get("region"),
+		RequestedAt: getInt("requested_at"),
+		Source:      get("source"),
+	}
+	if req.Name == "" || req.Realm == "" || req.Region == "" {
+		return nil, nil
+	}
+	return req, nil
+}
+
+// checkAndSendOptOut: if SavedVariables has a pending opt-out request that
+// we haven't already POSTed (per state.LastOptOutTs), send it to
+// /api/opt-out and on success record the timestamp.
+func checkAndSendOptOut(svPath, apiBase string, state *State) {
+	req, err := parseOptOutRequest(svPath)
+	if err != nil {
+		log.Printf("opt-out parse error: %v", err)
+		return
+	}
+	if req == nil {
+		return
+	}
+	if req.RequestedAt <= state.LastOptOutTs {
+		return // already processed
+	}
+	log.Printf("opt-out requested for %s-%s-%s (source=%s); POSTing to %s",
+		req.Name, req.Realm, req.Region, req.Source, apiBase)
+	body := map[string]interface{}{
+		"name":   req.Name,
+		"realm":  req.Realm,
+		"region": req.Region,
+		"reason": fmt.Sprintf("addon button (%s)", req.Source),
+	}
+	bodyJSON, _ := json.Marshal(body)
+	url := strings.TrimRight(apiBase, "/") + "/api/opt-out"
+	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(bodyJSON))
+	if err != nil {
+		log.Printf("opt-out request build failed: %v", err)
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("User-Agent", "voidscout-uploader/"+currentVersion)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		log.Printf("opt-out POST failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		state.LastOptOutTs = req.RequestedAt
+		log.Printf("opt-out POST ok: %s", string(respBody)[:min(len(respBody), 200)])
+	} else {
+		log.Printf("opt-out POST returned %d: %s", resp.StatusCode, string(respBody)[:min(len(respBody), 200)])
+	}
+}
+
 func parseSavedVars(path string) (map[string][]AddonFight, string, error) {
 	L := lua.NewState()
 	defer L.Close()
@@ -1324,10 +1713,142 @@ func detectLogsDirs() []string {
 // our addon disables on encounter/run end, so 60s of no activity is safe.
 const combatLogStable = 60 * time.Second
 
-// combatLogMaxBytes mirrors the server's MAX_UPLOAD_BYTES (200 MB). Files
-// larger than this are skipped with a warning — the server would reject
-// them anyway. Future improvement: split by ENCOUNTER_START markers.
-const combatLogMaxBytes = int64(200 * 1024 * 1024)
+// combatLogMaxBytes is the local sanity cap. Server's MAX_UPLOAD_BYTES is
+// 1 GB; this is a paranoia check so we never accidentally pump a 10 GB
+// rotating debug log up. 2 GB covers any legitimate raid night.
+const combatLogMaxBytes = int64(2 * 1024 * 1024 * 1024)
+
+// combatLogChunkThreshold is the file size above which we switch to
+// per-encounter chunked upload instead of pumping the whole file in one
+// POST. Cloudflare's Free/Pro tiers cap request bodies at 100 MB, so we
+// chunk at 90 MB to leave a safety margin for multipart overhead.
+const combatLogChunkThreshold = int64(90 * 1024 * 1024)
+
+// combatLogMaxChunkBytes is the hard cap on a single chunk after splitting.
+// If one encounter alone is bigger than this we have to skip it (a future
+// release can stream-split inside an encounter, but no pull in current
+// Mythic content gets close to 100 MB).
+const combatLogMaxChunkBytes = int64(95 * 1024 * 1024)
+
+// computeBackoff maps {http status, attempt#} → next-eligible-time offset.
+// 429: rate-limited. Server's per-char cap is 200/day; once we hit it, no
+//      point retrying for hours. Step: 5 min, 15 min, 1 hr, 6 hr, 24 hr.
+// 413: payload too big for Cloudflare. We've already switched to chunking
+//      mode if it's possible — a 413 on the chunked path means the chunk
+//      itself is bigger than 100 MB, can't fix at runtime. 24 hr cooldown
+//      so we don't spam the log.
+// 5xx: server-side issue. Short retry — 1 min, 5 min, 30 min, 2 hr.
+// 4xx other: client mistake we can't fix. Long cooldown — 6 hr — so the
+//      user has time to read the error before we retry.
+// 0 (transport error): network hiccup. Short retry — 30s, 2m, 10m, 1h.
+func computeBackoff(code, attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	switch {
+	case code == 429:
+		steps := []time.Duration{5 * time.Minute, 15 * time.Minute, 1 * time.Hour, 6 * time.Hour, 24 * time.Hour}
+		return steps[min(attempt-1, len(steps)-1)]
+	case code == 413:
+		return 24 * time.Hour
+	case code >= 500 && code < 600:
+		steps := []time.Duration{1 * time.Minute, 5 * time.Minute, 30 * time.Minute, 2 * time.Hour}
+		return steps[min(attempt-1, len(steps)-1)]
+	case code >= 400 && code < 500:
+		return 6 * time.Hour
+	case code == 0:
+		// Transport error — likely transient.
+		steps := []time.Duration{30 * time.Second, 2 * time.Minute, 10 * time.Minute, 1 * time.Hour}
+		return steps[min(attempt-1, len(steps)-1)]
+	}
+	return 5 * time.Minute
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// extractEncounterChunks splits a combat log into per-encounter mini-logs.
+// Each chunk starts with the file's `COMBAT_LOG_VERSION` header and the
+// preceding `ZONE_CHANGE` for context, followed by exactly one
+// ENCOUNTER_START → ENCOUNTER_END block. The server treats each chunk
+// like a normal upload — no new endpoint needed.
+//
+// Why per-encounter: the parser already operates one encounter at a time,
+// so splitting at the encounter boundary preserves all the data it
+// actually scores from. Trash between encounters is dropped, but the
+// scoring pipeline doesn't consume it anyway.
+//
+// Returns one byte slice per chunk. Skips encounters that exceed the
+// 95 MB per-chunk cap (logged so the user knows).
+func extractEncounterChunks(fileBytes []byte) [][]byte {
+	var chunks [][]byte
+	var header []byte // COMBAT_LOG_VERSION + last-seen ZONE_CHANGE
+
+	// Find COMBAT_LOG_VERSION line — must be present, it's literally line 1.
+	headerEnd := bytes.IndexByte(fileBytes, '\n')
+	if headerEnd < 0 {
+		return chunks
+	}
+	header = append(header, fileBytes[:headerEnd+1]...)
+
+	// Scan for ZONE_CHANGE + ENCOUNTER_START/END markers.
+	var lastZoneChange []byte
+	var inEncounter bool
+	var encStart int
+
+	pos := headerEnd + 1
+	for pos < len(fileBytes) {
+		// Find end of this line.
+		nl := bytes.IndexByte(fileBytes[pos:], '\n')
+		var lineEnd int
+		if nl < 0 {
+			lineEnd = len(fileBytes)
+		} else {
+			lineEnd = pos + nl + 1
+		}
+		line := fileBytes[pos:lineEnd]
+
+		// Skim past the timestamp prefix (`MM/DD/YYYY HH:MM:SS.mmm-N  `).
+		// Two-space separator marks the event payload.
+		idx := bytes.Index(line, []byte("  "))
+		eventStart := pos
+		if idx >= 0 {
+			eventStart = pos + idx + 2
+		}
+
+		if bytes.HasPrefix(fileBytes[eventStart:], []byte("ZONE_CHANGE,")) {
+			lastZoneChange = append(lastZoneChange[:0], line...)
+		} else if !inEncounter && bytes.HasPrefix(fileBytes[eventStart:], []byte("ENCOUNTER_START,")) {
+			inEncounter = true
+			encStart = pos
+		} else if inEncounter && bytes.HasPrefix(fileBytes[eventStart:], []byte("ENCOUNTER_END,")) {
+			// Build the chunk: header + last zone change + encounter slice.
+			var chunk []byte
+			chunk = append(chunk, header...)
+			if len(lastZoneChange) > 0 {
+				chunk = append(chunk, lastZoneChange...)
+			}
+			chunk = append(chunk, fileBytes[encStart:lineEnd]...)
+			if int64(len(chunk)) <= combatLogMaxChunkBytes {
+				chunks = append(chunks, chunk)
+			} else {
+				log.Printf("combatlog: skip oversize encounter chunk (%.1f MB > %d MB)",
+					float64(len(chunk))/1024/1024, combatLogMaxChunkBytes/1024/1024)
+			}
+			inEncounter = false
+			_ = encStart
+		}
+		pos = lineEnd
+		if nl < 0 {
+			break
+		}
+	}
+	return chunks
+}
 
 // scanCombatLogs walks all detected Logs directories, identifies stable
 // (no-recent-writes) WoWCombatLog-*.txt files we haven't uploaded yet,
@@ -1408,22 +1929,68 @@ func scanCombatLogs(apiBase string, state *State, statePath string, dryRun, verb
 				continue
 			}
 
+			// Per-file backoff. If we've failed previously and the cool-down
+			// hasn't expired, skip silently — burning the 200/day rate cap
+			// by retrying every 30s is exactly the bug we're fixing.
+			if r := state.CombatLogRetry[full]; r != nil && r.NextEligibleUnix > now.Unix() {
+				if verbose {
+					remaining := time.Until(time.Unix(r.NextEligibleUnix, 0))
+					log.Printf("combatlog: %s on backoff %s (attempt %d, last code %d: %s)",
+						name, remaining.Round(time.Second), r.AttemptCount, r.LastErrorCode, r.LastErrorMsg)
+				}
+				continue
+			}
+
 			if dryRun {
 				log.Printf("combatlog: [DRY] would upload %s (%.1f MB) as %s-%s-%s",
 					name, float64(st.Size())/1024/1024, playerName, playerRealm, playerRegion)
 				continue
 			}
 
-			log.Printf("combatlog: uploading %s (%.1f MB)...",
-				name, float64(st.Size())/1024/1024)
-			if err := uploadCombatLog(apiBase, full, playerName, playerRealm, playerRegion, verbose); err != nil {
-				log.Printf("combatlog: UPLOAD FAILED %s: %v", name, err)
+			// Chunked path for anything that would blow Cloudflare's 100MB body cap.
+			// Per-encounter chunks: each ENCOUNTER_START → ENCOUNTER_END block
+			// becomes its own POST to the same /api/upload-log endpoint.
+			var lastCode int
+			var lastErr error
+			if st.Size() > combatLogChunkThreshold {
+				log.Printf("combatlog: uploading %s in chunks (%.1f MB > %d MB threshold)",
+					name, float64(st.Size())/1024/1024, combatLogChunkThreshold/1024/1024)
+				lastCode, lastErr = uploadCombatLogChunked(apiBase, full, playerName, playerRealm, playerRegion, verbose)
+			} else {
+				log.Printf("combatlog: uploading %s (%.1f MB)...",
+					name, float64(st.Size())/1024/1024)
+				lastCode, lastErr = uploadCombatLog(apiBase, full, playerName, playerRealm, playerRegion, verbose)
+			}
+
+			if lastErr != nil {
+				log.Printf("combatlog: UPLOAD FAILED %s (code %d): %v", name, lastCode, lastErr)
+				// Record retry state so we back off intelligently.
+				if state.CombatLogRetry == nil {
+					state.CombatLogRetry = map[string]*CombatLogRetry{}
+				}
+				r := state.CombatLogRetry[full]
+				if r == nil {
+					r = &CombatLogRetry{}
+					state.CombatLogRetry[full] = r
+				}
+				r.AttemptCount++
+				r.LastErrorCode = lastCode
+				r.LastErrorAt = now.Unix()
+				r.LastErrorMsg = truncate(lastErr.Error(), 200)
+				backoff := computeBackoff(lastCode, r.AttemptCount)
+				r.NextEligibleUnix = now.Add(backoff).Unix()
+				log.Printf("combatlog: will retry %s in %s (attempt #%d)",
+					name, backoff.Round(time.Second), r.AttemptCount+1)
+				saveState(state, statePath)
 				continue
 			}
+
+			// Success — clear retry state, mark uploaded.
 			if state.UploadedCombatLogs == nil {
 				state.UploadedCombatLogs = map[string]bool{}
 			}
 			state.UploadedCombatLogs[full] = true
+			delete(state.CombatLogRetry, full)
 			saveState(state, statePath)
 			log.Printf("combatlog: uploaded %s", name)
 		}
@@ -1440,57 +2007,116 @@ func scanCombatLogs(apiBase string, state *State, statePath string, dryRun, verb
 // duration, which on Windows blocks `move`, `del`, and even `mv` from
 // other processes ("file is being used by another process"). The 200MB
 // upload cap means worst-case memory is 200MB, fine on any modern PC.
-func uploadCombatLog(apiBase, path, playerName, playerRealm, playerRegion string, verbose bool) error {
+func uploadCombatLog(apiBase, path, playerName, playerRealm, playerRegion string, verbose bool) (int, error) {
 	// Buffer the file content into memory first, then close the handle.
 	fileBytes, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("read: %w", err)
+		return 0, fmt.Errorf("read: %w", err)
 	}
+	return postCombatLogBytes(apiBase, filepath.Base(path), fileBytes, playerName, playerRealm, playerRegion, verbose)
+}
 
+// uploadCombatLogChunked splits the log at ENCOUNTER_START/END boundaries
+// and POSTs each chunk separately. Each chunk is a self-contained mini
+// combat log (COMBAT_LOG_VERSION + last ZONE_CHANGE + one encounter), so
+// the existing server endpoint handles them with no changes.
+//
+// Returns the worst HTTP code seen and the first error encountered, since
+// the caller's backoff logic only needs one code/error to decide what to do.
+// If ANY chunk fails, the whole file is treated as failed (we don't want to
+// mark a partially-uploaded log as done — re-uploading is idempotent
+// thanks to the (player_id, fight_id, contributor) PK).
+func uploadCombatLogChunked(apiBase, path, playerName, playerRealm, playerRegion string, verbose bool) (int, error) {
+	fileBytes, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("read: %w", err)
+	}
+	chunks := extractEncounterChunks(fileBytes)
+	if len(chunks) == 0 {
+		return 422, fmt.Errorf("no encounters found in file (was /combatlog on?)")
+	}
+	base := filepath.Base(path)
+	log.Printf("combatlog: split %s into %d encounter chunks", base, len(chunks))
+	var worstCode int
+	var firstErr error
+	for i, chunk := range chunks {
+		chunkName := fmt.Sprintf("%s.chunk%d.txt", base, i+1)
+		if verbose {
+			log.Printf("combatlog: chunk %d/%d (%.1f MB)",
+				i+1, len(chunks), float64(len(chunk))/1024/1024)
+		}
+		code, err := postCombatLogBytes(apiBase, chunkName, chunk, playerName, playerRealm, playerRegion, verbose)
+		if err != nil {
+			log.Printf("combatlog: chunk %d/%d FAILED (code %d): %v", i+1, len(chunks), code, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("chunk %d/%d: %w", i+1, len(chunks), err)
+				worstCode = code
+			}
+			// On 429 we abort immediately — every subsequent chunk would also
+			// 429 and waste retries. Same on 413: the chunk size is too big
+			// and re-chunking inside an encounter isn't supported yet.
+			if code == 429 || code == 413 {
+				return code, firstErr
+			}
+			// 5xx might be transient (server restart) — try the next chunk.
+			continue
+		}
+		log.Printf("combatlog: chunk %d/%d ok", i+1, len(chunks))
+	}
+	if firstErr != nil {
+		return worstCode, firstErr
+	}
+	return 200, nil
+}
+
+// postCombatLogBytes is the shared multipart-POST helper. Returns the HTTP
+// status code (0 if the transport itself failed) and an error describing
+// what went wrong. Successful (2xx) responses return (code, nil).
+func postCombatLogBytes(apiBase, filename string, fileBytes []byte, playerName, playerRealm, playerRegion string, verbose bool) (int, error) {
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
 	if err := mw.WriteField("character_name", playerName); err != nil {
-		return err
+		return 0, err
 	}
 	if err := mw.WriteField("realm", playerRealm); err != nil {
-		return err
+		return 0, err
 	}
 	if err := mw.WriteField("region", playerRegion); err != nil {
-		return err
+		return 0, err
 	}
-	part, err := mw.CreateFormFile("file", filepath.Base(path))
+	part, err := mw.CreateFormFile("file", filename)
 	if err != nil {
-		return fmt.Errorf("create form file: %w", err)
+		return 0, fmt.Errorf("create form file: %w", err)
 	}
 	if _, err := part.Write(fileBytes); err != nil {
-		return fmt.Errorf("write file body: %w", err)
+		return 0, fmt.Errorf("write file body: %w", err)
 	}
 	if err := mw.Close(); err != nil {
-		return err
+		return 0, err
 	}
 
 	req, err := http.NewRequest("POST", apiBase+"/api/upload-log", &body)
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return 0, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req.Header.Set("User-Agent", fmt.Sprintf("voidscout-uploader/%s", currentVersion))
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: 600 * time.Second} // server can take ~5 min on a big file
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("do request: %w", err)
+		return 0, fmt.Errorf("do request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 300))
+		return resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(respBody), 300))
 	}
 	if verbose {
 		log.Printf("combatlog: server response: %s", truncate(string(respBody), 300))
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 // splitContributor splits "Name-Realm" or "Name-Realm-Region" into parts.
