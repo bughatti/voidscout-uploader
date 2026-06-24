@@ -41,15 +41,16 @@ const (
 
 	// Profile upload — uploaded on startup + periodic refresh.
 	// Server caps batches at 100 (MAX_PROFILES_PER_REQUEST in profile_endpoint.py).
-	profileBatchSize     = 50
-	profileLoopInterval  = 5 * time.Minute
-	profileStartupDelay  = 5 * time.Second
-	profileMaxAgeDays    = 30 // skip players we haven't seen in this many days
+	profileBatchSize    = 50
+	profileLoopInterval = 5 * time.Minute
+	profileStartupDelay = 5 * time.Second
+	profileMaxAgeDays   = 30 // skip players we haven't seen in this many days
 
 	// Auto-update
-	updateRepo    = "bughatti/voidscout-uploader"   // public GitHub repo for releases
-	updateCheckTimeout = 10 * time.Second
-	currentVersion = "0.4.1"                         // bumped on each release; compared to GitHub
+	updateRepo          = "bughatti/voidscout-uploader" // public GitHub repo for releases
+	updateCheckTimeout  = 10 * time.Second
+	updateCheckInterval = 6 * time.Hour // re-check while running, not only at launch
+	currentVersion      = "0.4.2"       // bumped on each release; compared to GitHub
 
 	// Combat log scan cadence — the addon auto-toggles /combatlog on
 	// encounter/run boundaries, so files appear and stabilize at that
@@ -74,12 +75,12 @@ type AddonFight struct {
 	PugID         string                 `json:"pug_id"`
 	Class         string                 `json:"class"`
 	Spec          string                 `json:"spec"`
-	Mode          string                 `json:"mode"`           // "raid" | "mplus" | "dungeon"
+	Mode          string                 `json:"mode"` // "raid" | "mplus" | "dungeon"
 	Uploaded      bool                   `json:"uploaded"`
 	Axes          map[string]float64     `json:"axes"`
 	Roster        []string               `json:"roster"`
-	Raw           map[string]interface{} `json:"raw,omitempty"`         // dps, casts, avoidable_taken, etc — peer pool seed
-	RunID         string                 `json:"run_id,omitempty"`      // groups M+ pulls into one run-event
+	Raw           map[string]interface{} `json:"raw,omitempty"`          // dps, casts, avoidable_taken, etc — peer pool seed
+	RunID         string                 `json:"run_id,omitempty"`       // groups M+ pulls into one run-event
 	DataQuality   string                 `json:"data_quality,omitempty"` // "ok" or "stale" (DC/AFK/reset)
 }
 
@@ -96,7 +97,7 @@ type IngestFight struct {
 	DurationSec   int                    `json:"duration_sec"`
 	Timestamp     int64                  `json:"timestamp"`
 	PugID         string                 `json:"pug_id,omitempty"`
-	Mode          string                 `json:"mode,omitempty"`   // "raid" | "mplus" | "dungeon"
+	Mode          string                 `json:"mode,omitempty"` // "raid" | "mplus" | "dungeon"
 	Axes          map[string]float64     `json:"axes"`
 	Roster        []string               `json:"roster,omitempty"`
 	Raw           map[string]interface{} `json:"raw,omitempty"`
@@ -130,22 +131,22 @@ type CombatLogRetry struct {
 }
 
 type State struct {
-	LastUploadedTs      int64           `json:"last_uploaded_ts"` // upload all fights with ts > this
-	Contributor         string          `json:"contributor"`      // last-known uploading character
-	UploadedCombatLogs  map[string]bool `json:"uploaded_combat_logs,omitempty"` // filename -> uploaded?
-	UploadedRealm       string          `json:"uploaded_realm,omitempty"`       // last-known realm
-	UploadedRegion      string          `json:"uploaded_region,omitempty"`      // last-known region
+	LastUploadedTs     int64           `json:"last_uploaded_ts"`               // upload all fights with ts > this
+	Contributor        string          `json:"contributor"`                    // last-known uploading character
+	UploadedCombatLogs map[string]bool `json:"uploaded_combat_logs,omitempty"` // filename -> uploaded?
+	UploadedRealm      string          `json:"uploaded_realm,omitempty"`       // last-known realm
+	UploadedRegion     string          `json:"uploaded_region,omitempty"`      // last-known region
 	// Per-file retry state. Empty/missing entries mean "go ahead and try."
-	CombatLogRetry      map[string]*CombatLogRetry `json:"combat_log_retry,omitempty"`
+	CombatLogRetry map[string]*CombatLogRetry `json:"combat_log_retry,omitempty"`
 	// VRT Session Recorder uploads — session_id -> uploaded? Tracked here
 	// so we don't re-POST the same session if the addon's pending_uploads
 	// queue keeps it around (the addon can't drop entries without /reload).
-	UploadedSessions    map[string]bool `json:"uploaded_sessions,omitempty"`
+	UploadedSessions map[string]bool `json:"uploaded_sessions,omitempty"`
 	// Opt-out request — last requested_at we've successfully POSTed to
 	// /api/opt-out. The addon writes VoidScoutDB.opt_out_requested when
 	// the user clicks the "Delete + go local" button; the uploader picks
 	// it up on next run and POSTs the deletion request to the server.
-	LastOptOutTs        int64           `json:"last_opt_out_ts,omitempty"`
+	LastOptOutTs int64 `json:"last_opt_out_ts,omitempty"`
 }
 
 // ProfileUpload mirrors PlayerScan's per-player record shape — only the
@@ -368,10 +369,24 @@ func performAutoUpdate(verbose bool) {
 		log.Printf("auto-update: failed: %v", err)
 		return
 	}
-	log.Printf("auto-update: replaced %s — please restart for changes to take effect", exe)
-	// Note: we don't auto-exec the new binary here because the running process
-	// has open file handles, watchers, etc. Cleaner to log + let user restart,
-	// or let the process exit naturally on next reboot.
+	// Relaunch the freshly-staged binary so the update actually takes effect. A
+	// long-running daemon would otherwise keep running the old code until the
+	// next logon/reboot. The lock is a PID file, so we must release it BEFORE
+	// spawning the successor (else the child sees our still-alive PID and bails),
+	// then hand off and exit. On relaunch failure we re-hold the lock and leave
+	// the staged binary to apply on the next normal restart.
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Env = os.Environ()
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	cmd.SysProcAttr = relaunchSysProcAttr()
+	releaseSingleInstanceLock()
+	if err := cmd.Start(); err != nil {
+		log.Printf("auto-update: relaunch failed (%v) — staged %s applies on next restart", err, newVer)
+		_ = acquireSingleInstanceLock()
+		return
+	}
+	log.Printf("auto-update: %s is live in the new process — exiting old one", newVer)
+	os.Exit(0)
 }
 
 // syncWriter forces an fsync after every Write so log output is visible to
@@ -730,6 +745,16 @@ func main() {
 	// User can skip with -no-update flag.
 	if !*noUpdate {
 		performAutoUpdate(*verbose)
+		// Keep checking while we run. With only the launch-time check above, a
+		// daemon left up for days/weeks never sees a new release — which is
+		// exactly why field installs stayed pinned to old versions.
+		go func() {
+			t := time.NewTicker(updateCheckInterval)
+			defer t.Stop()
+			for range t.C {
+				performAutoUpdate(false)
+			}
+		}()
 	}
 	// Clean up Windows .old file from a previous self-replace
 	if runtime.GOOS == "windows" {
@@ -950,11 +975,11 @@ func wowInstallPaths() []string {
 // Written by the in-addon "Delete + go local" buttons in VoidScout's and
 // VRTReader's consent dialogs. Drained by checkAndSendOptOut().
 type OptOutRequest struct {
-	Name         string
-	Realm        string
-	Region       string
-	RequestedAt  int64
-	Source       string
+	Name        string
+	Realm       string
+	Region      string
+	RequestedAt int64
+	Source      string
 }
 
 // parseOptOutRequest reads VoidScoutDB.opt_out_requested from any
@@ -1400,9 +1425,9 @@ func runProfileBatch(svPath, apiBase string, lastUploadedLastSeen map[string]int
 	maxAge := int64(profileMaxAgeDays) * 86400
 	var pending []ProfileUpload
 	var (
-		skippedLevel   int
-		skippedStale   int
-		skippedNoSlug  int
+		skippedLevel    int
+		skippedStale    int
+		skippedNoSlug   int
 		skippedNoChange int
 	)
 	for _, p := range profiles {
