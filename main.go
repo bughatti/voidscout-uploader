@@ -49,7 +49,7 @@ const (
 	// Auto-update
 	updateRepo    = "bughatti/voidscout-uploader"   // public GitHub repo for releases
 	updateCheckTimeout = 10 * time.Second
-	currentVersion = "0.4.0"                         // bumped on each release; compared to GitHub
+	currentVersion = "0.4.1"                         // bumped on each release; compared to GitHub
 
 	// Combat log scan cadence — the addon auto-toggles /combatlog on
 	// encounter/run boundaries, so files appear and stabilize at that
@@ -1720,9 +1720,13 @@ const combatLogMaxBytes = int64(2 * 1024 * 1024 * 1024)
 
 // combatLogChunkThreshold is the file size above which we switch to
 // per-encounter chunked upload instead of pumping the whole file in one
-// POST. Cloudflare's Free/Pro tiers cap request bodies at 100 MB, so we
-// chunk at 90 MB to leave a safety margin for multipart overhead.
-const combatLogChunkThreshold = int64(90 * 1024 * 1024)
+// POST. Cloudflare's Free/Pro tiers cap bodies at 100 MB, but in practice a
+// single whole-file upload through the cloudflared tunnel gets flaky well
+// below that — a 25.9 MB log intermittently 400'd ("expected multipart") in
+// transit. So we chunk early (8 MB): per-encounter chunks are small and
+// robust everywhere, which is also what keeps public (non-bypass) users
+// CF-safe. See [[voidscout-upload-cf-bypass-constraint]].
+const combatLogChunkThreshold = int64(8 * 1024 * 1024)
 
 // combatLogMaxChunkBytes is the hard cap on a single chunk after splitting.
 // If one encounter alone is bigger than this we have to skip it (a future
@@ -1963,6 +1967,22 @@ func scanCombatLogs(apiBase string, state *State, statePath string, dryRun, verb
 			}
 
 			if lastErr != nil {
+				// 422 = the server parsed the log fine; there was simply nothing
+				// scorable in it (dummy / trash / abandoned — no completed boss
+				// fight). That's a terminal SUCCESS, not a retryable failure: mark
+				// it done so we stop re-uploading a no-boss log every 6h forever.
+				// Covers BOTH paths — the whole-file path returns the server's 422,
+				// and the chunked path returns 422 when len(chunks)==0 (no encounters).
+				if lastCode == 422 {
+					if state.UploadedCombatLogs == nil {
+						state.UploadedCombatLogs = map[string]bool{}
+					}
+					state.UploadedCombatLogs[full] = true
+					delete(state.CombatLogRetry, full)
+					saveState(state, statePath)
+					log.Printf("combatlog: %s — no scorable encounters, marking done (no retry)", name)
+					continue
+				}
 				log.Printf("combatlog: UPLOAD FAILED %s (code %d): %v", name, lastCode, lastErr)
 				// Record retry state so we back off intelligently.
 				if state.CombatLogRetry == nil {
@@ -2037,8 +2057,18 @@ func uploadCombatLogChunked(apiBase, path, playerName, playerRealm, playerRegion
 	}
 	base := filepath.Base(path)
 	log.Printf("combatlog: split %s into %d encounter chunks", base, len(chunks))
-	var worstCode int
-	var firstErr error
+	// A multi-session log routinely contains chunks with nothing scorable —
+	// target-dummy tests, trash-only segments, abandoned pulls. The server
+	// answers those with 422 "no scorable encounters". That is NOT a file
+	// failure: skip the empty chunk and keep the GOOD encounters that already
+	// uploaded. Only a real error (5xx / network / 413 / 429) fails the whole
+	// file and triggers backoff. (Before this, ONE 422 chunk poisoned the
+	// entire file — a completed +15 sitting alongside a morning of dummy
+	// testing never got marked done. Verified 2026-06-12: the +15 chunks POST
+	// 200 individually; it was the dummy-test chunks' 422 failing the file.)
+	var realCode int
+	var realErr error
+	okCount, skipped := 0, 0
 	for i, chunk := range chunks {
 		chunkName := fmt.Sprintf("%s.chunk%d.txt", base, i+1)
 		if verbose {
@@ -2047,25 +2077,35 @@ func uploadCombatLogChunked(apiBase, path, playerName, playerRealm, playerRegion
 		}
 		code, err := postCombatLogBytes(apiBase, chunkName, chunk, playerName, playerRealm, playerRegion, verbose)
 		if err != nil {
-			log.Printf("combatlog: chunk %d/%d FAILED (code %d): %v", i+1, len(chunks), code, err)
-			if firstErr == nil {
-				firstErr = fmt.Errorf("chunk %d/%d: %w", i+1, len(chunks), err)
-				worstCode = code
+			// 422 = this chunk has no scorable encounter (dummy/trash/abandoned).
+			// Expected in a mixed log — skip it, do NOT fail the file.
+			if code == 422 {
+				skipped++
+				if verbose {
+					log.Printf("combatlog: chunk %d/%d no scorable encounters — skipping", i+1, len(chunks))
+				}
+				continue
 			}
-			// On 429 we abort immediately — every subsequent chunk would also
-			// 429 and waste retries. Same on 413: the chunk size is too big
-			// and re-chunking inside an encounter isn't supported yet.
+			log.Printf("combatlog: chunk %d/%d FAILED (code %d): %v", i+1, len(chunks), code, err)
+			if realErr == nil {
+				realErr = fmt.Errorf("chunk %d/%d: %w", i+1, len(chunks), err)
+				realCode = code
+			}
+			// 429/413 won't fix on the next chunk — abort the file now.
 			if code == 429 || code == 413 {
-				return code, firstErr
+				return code, realErr
 			}
 			// 5xx might be transient (server restart) — try the next chunk.
 			continue
 		}
+		okCount++
 		log.Printf("combatlog: chunk %d/%d ok", i+1, len(chunks))
 	}
-	if firstErr != nil {
-		return worstCode, firstErr
+	// Only a genuine error fails the file. Empty (422) chunks are fine.
+	if realErr != nil {
+		return realCode, realErr
 	}
+	log.Printf("combatlog: %s complete — %d scored, %d skipped (no scorable encounters)", base, okCount, skipped)
 	return 200, nil
 }
 
