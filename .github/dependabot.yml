@@ -1,0 +1,19 @@
+# Security fixes arrive as soon as an advisory is published, regardless of this
+# schedule. This adds weekly routine updates, grouped into few pull requests.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
