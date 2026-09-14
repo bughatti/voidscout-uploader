@@ -41,8 +41,8 @@ jobs:
             goarch: arm64
             ext: ''
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -60,7 +60,7 @@ jobs:
           go build -ldflags "-s -w" -o "$OUT" .
           ls -lh "$OUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: voidscout-uploader-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/voidscout-uploader-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
@@ -71,8 +71,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
