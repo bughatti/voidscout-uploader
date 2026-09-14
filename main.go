@@ -50,7 +50,7 @@ const (
 	updateRepo          = "bughatti/voidscout-uploader" // public GitHub repo for releases
 	updateCheckTimeout  = 10 * time.Second
 	updateCheckInterval = 6 * time.Hour // re-check while running, not only at launch
-	currentVersion      = "0.4.2"       // bumped on each release; compared to GitHub
+	currentVersion      = "0.4.3"       // bumped on each release; compared to GitHub
 
 	// Combat log scan cadence — the addon auto-toggles /combatlog on
 	// encounter/run boundaries, so files appear and stabilize at that
