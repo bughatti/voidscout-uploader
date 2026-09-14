@@ -16,7 +16,7 @@ build() {
         -w /src \
         -e GOOS=$goos -e GOARCH=$goarch \
         -e CGO_ENABLED=0 \
-        golang:1.22-alpine \
+        golang:1.26.8-alpine \
         sh -c "go mod tidy && go build -ldflags '-s -w -X main.version=$VERSION' -o $OUTDIR/$name ."
     ls -lh "$OUTDIR/$name"
 }
