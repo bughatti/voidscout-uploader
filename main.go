@@ -50,7 +50,7 @@ const (
 	updateRepo          = "bughatti/voidscout-uploader" // public GitHub repo for releases
 	updateCheckTimeout  = 10 * time.Second
 	updateCheckInterval = 6 * time.Hour // re-check while running, not only at launch
-	currentVersion      = "0.4.3"       // bumped on each release; compared to GitHub
+	currentVersion      = "0.4.4"       // bumped on each release; compared to GitHub
 
 	// Combat log scan cadence — the addon auto-toggles /combatlog on
 	// encounter/run boundaries, so files appear and stabilize at that
@@ -134,6 +134,12 @@ type State struct {
 	LastUploadedTs     int64           `json:"last_uploaded_ts"`               // upload all fights with ts > this
 	Contributor        string          `json:"contributor"`                    // last-known uploading character
 	UploadedCombatLogs map[string]bool `json:"uploaded_combat_logs,omitempty"` // filename -> uploaded?
+	// Size of each log when it was last uploaded. WoW keeps appending to the SAME
+	// file all session, so "uploaded once" missed everything after the first
+	// upload (2026-10-21: sent at 0.9 MB, a timed +2 later in the 65 MB file never
+	// went up). A log that has grown since is re-sent; the server dedups fights
+	// by canonical fight id, so re-sending earlier encounters is harmless.
+	UploadedCombatLogSize map[string]int64 `json:"uploaded_combat_log_size,omitempty"`
 	UploadedRealm      string          `json:"uploaded_realm,omitempty"`       // last-known realm
 	UploadedRegion     string          `json:"uploaded_region,omitempty"`      // last-known region
 	// Per-file retry state. Empty/missing entries mean "go ahead and try."
@@ -496,7 +502,7 @@ func luaTableToInterface(t *lua.LTable) interface{} {
 func parseVRTReaderSessions(path string) ([]map[string]interface{}, error) {
 	L := lua.NewState()
 	defer L.Close()
-	if err := L.DoFile(path); err != nil {
+	if err := doFileShared(L, path); err != nil {
 		return nil, fmt.Errorf("execute lua: %w", err)
 	}
 	db := L.GetGlobal("VoidRaidToolsReaderDB")
@@ -988,7 +994,7 @@ type OptOutRequest struct {
 func parseOptOutRequest(path string) (*OptOutRequest, error) {
 	L := lua.NewState()
 	defer L.Close()
-	if err := L.DoFile(path); err != nil {
+	if err := doFileShared(L, path); err != nil {
 		return nil, fmt.Errorf("execute lua: %w", err)
 	}
 	db := L.GetGlobal("VoidScoutDB")
@@ -1075,10 +1081,28 @@ func checkAndSendOptOut(svPath, apiBase string, state *State) {
 	}
 }
 
+// doFileShared runs a SavedVariables file from an in-memory copy. L.DoFile keeps
+// the file open for the whole parse (seconds for a 27 MB VoidScout.lua), and any
+// WoW save landing in that window fails to replace the file -- WoW then keeps the
+// old save and the new data is lost. readShared grabs it in one quick read that
+// never blocks WoW's swap.
+func doFileShared(L *lua.LState, path string) error {
+	data, err := readShared(path)
+	if err != nil {
+		return err
+	}
+	fn, err := L.Load(bytes.NewReader(data), path)
+	if err != nil {
+		return err
+	}
+	L.Push(fn)
+	return L.PCall(0, lua.MultRet, nil)
+}
+
 func parseSavedVars(path string) (map[string][]AddonFight, string, error) {
 	L := lua.NewState()
 	defer L.Close()
-	if err := L.DoFile(path); err != nil {
+	if err := doFileShared(L, path); err != nil {
 		return nil, "", fmt.Errorf("execute lua: %w", err)
 	}
 	db := L.GetGlobal("VoidScoutDB")
@@ -1500,7 +1524,7 @@ func runProfileBatch(svPath, apiBase string, lastUploadedLastSeen map[string]int
 func parseProfiles(path string) ([]ProfileUpload, string, error) {
 	L := lua.NewState()
 	defer L.Close()
-	if err := L.DoFile(path); err != nil {
+	if err := doFileShared(L, path); err != nil {
 		return nil, "", fmt.Errorf("execute lua: %w", err)
 	}
 	db := L.GetGlobal("VoidScoutDB")
@@ -1814,6 +1838,16 @@ func min(a, b int) int {
 // Returns one byte slice per chunk. Skips encounters that exceed the
 // 95 MB per-chunk cap (logged so the user knows).
 func extractEncounterChunks(fileBytes []byte) [][]byte {
+	return extractEncounterChunksAfter(fileBytes, 0)
+}
+
+// extractEncounterChunksAfter is extractEncounterChunks limited to encounters that
+// ENDED past byte offset `after` -- i.e. ones finished since a log was last
+// uploaded. Raw combat events are stored append-only server-side, so re-sending
+// already-uploaded encounters would duplicate them; this sends only the new ones.
+// An encounter straddling `after` was unfinished at the last upload (so it wasn't
+// scored then) and is included.
+func extractEncounterChunksAfter(fileBytes []byte, after int64) [][]byte {
 	var chunks [][]byte
 	var header []byte // COMBAT_LOG_VERSION + last-seen ZONE_CHANGE
 
@@ -1854,6 +1888,8 @@ func extractEncounterChunks(fileBytes []byte) [][]byte {
 		} else if !inEncounter && bytes.HasPrefix(fileBytes[eventStart:], []byte("ENCOUNTER_START,")) {
 			inEncounter = true
 			encStart = pos
+		} else if inEncounter && bytes.HasPrefix(fileBytes[eventStart:], []byte("ENCOUNTER_END,")) && int64(lineEnd) <= after {
+			inEncounter = false // already sent with an earlier upload of this log
 		} else if inEncounter && bytes.HasPrefix(fileBytes[eventStart:], []byte("ENCOUNTER_END,")) {
 			// Build the chunk: header + last zone change + encounter slice.
 			var chunk []byte
@@ -1929,15 +1965,33 @@ func scanCombatLogs(apiBase string, state *State, statePath string, dryRun, verb
 				continue
 			}
 			full := filepath.Join(dir, name)
-			if state.UploadedCombatLogs[full] {
-				continue
-			}
 			st, err := os.Stat(full)
 			if err != nil {
 				continue
 			}
 			if st.Size() == 0 {
 				continue
+			}
+			// topUp: this log was uploaded before and has grown -> send only the
+			// encounters that finished after `after` (0 = legacy entry, size unknown).
+			topUp, after := false, int64(0)
+			if state.UploadedCombatLogs[full] {
+				topUp = true
+				sent, known := state.UploadedCombatLogSize[full]
+				if known {
+					after = sent
+				}
+				if !known {
+					// Marked before sizes were tracked. Recent logs may have grown
+					// after their one upload -> re-send once; older ones are settled.
+					if now.Sub(st.ModTime()) > 48*time.Hour {
+						markLogSize(state, full, st.Size())
+						saveState(state, statePath)
+						continue
+					}
+				} else if st.Size() <= sent {
+					continue
+				}
 			}
 			if st.Size() > combatLogMaxBytes {
 				log.Printf("combatlog: SKIP %s (%.1f MB > %d MB cap)",
@@ -1947,6 +2001,7 @@ func scanCombatLogs(apiBase string, state *State, statePath string, dryRun, verb
 					state.UploadedCombatLogs = map[string]bool{}
 				}
 				state.UploadedCombatLogs[full] = true
+				markLogSize(state, full, st.Size())
 				saveState(state, statePath)
 				continue
 			}
@@ -1981,7 +2036,11 @@ func scanCombatLogs(apiBase string, state *State, statePath string, dryRun, verb
 			// becomes its own POST to the same /api/upload-log endpoint.
 			var lastCode int
 			var lastErr error
-			if st.Size() > combatLogChunkThreshold {
+			if topUp {
+				log.Printf("combatlog: %s grew since its last upload (%.1f MB now) -- sending new encounters",
+					name, float64(st.Size())/1024/1024)
+				lastCode, lastErr = uploadCombatLogChunkedAfter(apiBase, full, playerName, playerRealm, playerRegion, after, verbose)
+			} else if st.Size() > combatLogChunkThreshold {
 				log.Printf("combatlog: uploading %s in chunks (%.1f MB > %d MB threshold)",
 					name, float64(st.Size())/1024/1024, combatLogChunkThreshold/1024/1024)
 				lastCode, lastErr = uploadCombatLogChunked(apiBase, full, playerName, playerRealm, playerRegion, verbose)
@@ -2003,6 +2062,7 @@ func scanCombatLogs(apiBase string, state *State, statePath string, dryRun, verb
 						state.UploadedCombatLogs = map[string]bool{}
 					}
 					state.UploadedCombatLogs[full] = true
+					markLogSize(state, full, st.Size())
 					delete(state.CombatLogRetry, full)
 					saveState(state, statePath)
 					log.Printf("combatlog: %s — no scorable encounters, marking done (no retry)", name)
@@ -2035,11 +2095,21 @@ func scanCombatLogs(apiBase string, state *State, statePath string, dryRun, verb
 				state.UploadedCombatLogs = map[string]bool{}
 			}
 			state.UploadedCombatLogs[full] = true
+			markLogSize(state, full, st.Size())
 			delete(state.CombatLogRetry, full)
 			saveState(state, statePath)
 			log.Printf("combatlog: uploaded %s", name)
 		}
 	}
+}
+
+// markLogSize records how big a combat log was when it was last handled, so a
+// later scan re-sends it only if WoW has appended more since.
+func markLogSize(state *State, path string, size int64) {
+	if state.UploadedCombatLogSize == nil {
+		state.UploadedCombatLogSize = map[string]int64{}
+	}
+	state.UploadedCombatLogSize[path] = size
 }
 
 // uploadCombatLog POSTs a single file via multipart/form-data to
@@ -2072,11 +2142,17 @@ func uploadCombatLog(apiBase, path, playerName, playerRealm, playerRegion string
 // mark a partially-uploaded log as done — re-uploading is idempotent
 // thanks to the (player_id, fight_id, contributor) PK).
 func uploadCombatLogChunked(apiBase, path, playerName, playerRealm, playerRegion string, verbose bool) (int, error) {
+	return uploadCombatLogChunkedAfter(apiBase, path, playerName, playerRealm, playerRegion, 0, verbose)
+}
+
+// uploadCombatLogChunkedAfter sends only the encounters that finished past byte
+// offset `after` (0 = all of them). Used to top up a log that grew since its last upload.
+func uploadCombatLogChunkedAfter(apiBase, path, playerName, playerRealm, playerRegion string, after int64, verbose bool) (int, error) {
 	fileBytes, err := os.ReadFile(path)
 	if err != nil {
 		return 0, fmt.Errorf("read: %w", err)
 	}
-	chunks := extractEncounterChunks(fileBytes)
+	chunks := extractEncounterChunksAfter(fileBytes, after)
 	if len(chunks) == 0 {
 		return 422, fmt.Errorf("no encounters found in file (was /combatlog on?)")
 	}
