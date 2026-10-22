@@ -50,7 +50,7 @@ const (
 	updateRepo          = "bughatti/voidscout-uploader" // public GitHub repo for releases
 	updateCheckTimeout  = 10 * time.Second
 	updateCheckInterval = 6 * time.Hour // re-check while running, not only at launch
-	currentVersion      = "0.4.4"       // bumped on each release; compared to GitHub
+	currentVersion      = "0.4.5"       // bumped on each release; compared to GitHub
 
 	// Combat log scan cadence — the addon auto-toggles /combatlog on
 	// encounter/run boundaries, so files appear and stabilize at that
@@ -1155,10 +1155,17 @@ func parseSavedVars(path string) (map[string][]AddonFight, string, error) {
 		}
 	})
 
-	// Contributor = the uploading character. Heuristic: the name with the
-	// MOST fight rows (your own character will have a row for every fight
-	// they were in across multiple pugs). If we can't tell, leave empty.
-	contributor := pickContributor(out)
+	// Contributor = the uploading character. VoidScout 0.37.12+ records it at
+	// login (VoidScoutDB.me.key, "Name-Realm"). Older addons don't, so fall
+	// back to the old heuristic: the name with the MOST fight rows — which
+	// misfires when a frequent groupmate has more rows than you.
+	contributor := ""
+	if me, ok := dbT.RawGetString("me").(*lua.LTable); ok {
+		contributor = strField(me, "key")
+	}
+	if contributor == "" {
+		contributor = pickContributor(out)
+	}
 	return out, contributor, nil
 }
 
