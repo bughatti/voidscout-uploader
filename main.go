@@ -1865,8 +1865,8 @@ func extractEncounterChunksAfter(fileBytes []byte, after int64) [][]byte {
 	}
 	header = append(header, fileBytes[:headerEnd+1]...)
 
-	// Scan for ZONE_CHANGE + ENCOUNTER_START/END markers.
-	var lastZoneChange []byte
+	// Scan for ZONE_CHANGE, CHALLENGE_MODE_START/END and ENCOUNTER_START/END markers.
+	var lastZoneChange, lastKeyStart []byte
 	var inEncounter bool
 	var encStart int
 
@@ -1892,17 +1892,24 @@ func extractEncounterChunksAfter(fileBytes []byte, after int64) [][]byte {
 
 		if bytes.HasPrefix(fileBytes[eventStart:], []byte("ZONE_CHANGE,")) {
 			lastZoneChange = append(lastZoneChange[:0], line...)
+		} else if bytes.HasPrefix(fileBytes[eventStart:], []byte("CHALLENGE_MODE_START,")) {
+			lastKeyStart = append(lastKeyStart[:0], line...) // the key level for this run's bosses
+		} else if bytes.HasPrefix(fileBytes[eventStart:], []byte("CHALLENGE_MODE_END,")) {
+			lastKeyStart = lastKeyStart[:0]
 		} else if !inEncounter && bytes.HasPrefix(fileBytes[eventStart:], []byte("ENCOUNTER_START,")) {
 			inEncounter = true
 			encStart = pos
 		} else if inEncounter && bytes.HasPrefix(fileBytes[eventStart:], []byte("ENCOUNTER_END,")) && int64(lineEnd) <= after {
 			inEncounter = false // already sent with an earlier upload of this log
 		} else if inEncounter && bytes.HasPrefix(fileBytes[eventStart:], []byte("ENCOUNTER_END,")) {
-			// Build the chunk: header + last zone change + encounter slice.
+			// Build the chunk: header + last zone change + Mythic+ key start + encounter slice.
 			var chunk []byte
 			chunk = append(chunk, header...)
 			if len(lastZoneChange) > 0 {
 				chunk = append(chunk, lastZoneChange...)
+			}
+			if len(lastKeyStart) > 0 {
+				chunk = append(chunk, lastKeyStart...)
 			}
 			chunk = append(chunk, fileBytes[encStart:lineEnd]...)
 			if int64(len(chunk)) <= combatLogMaxChunkBytes {
