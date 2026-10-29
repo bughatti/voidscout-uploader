@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	lua "github.com/yuin/gopher-lua"
@@ -845,6 +846,9 @@ func runOnce(svPath, apiBase string, state *State, statePath string, dryRun, ver
 		}
 	}
 
+	// Damage-sim sharing (/vs sim on in the addon): combat-log uploads then carry sim=1.
+	simOptIn.Store(readSimOptIn(svPath))
+
 	fights, contributor, err := parseSavedVars(svPath)
 	if err != nil {
 		log.Printf("parse error: %v", err)
@@ -986,6 +990,25 @@ type OptOutRequest struct {
 	Region      string
 	RequestedAt int64
 	Source      string
+}
+
+// simOptIn mirrors VoidScoutDB.sim_opt_in (the addon's /vs sim on): when set, combat-log
+// uploads ask the server to keep the sim detail (sim=1). Re-read on every SavedVariables
+// change.
+var simOptIn atomic.Bool
+
+// readSimOptIn reports whether VoidScoutDB.sim_opt_in is true in the SavedVariables file.
+func readSimOptIn(path string) bool {
+	L := lua.NewState()
+	defer L.Close()
+	if err := doFileShared(L, path); err != nil {
+		return false
+	}
+	db := L.GetGlobal("VoidScoutDB")
+	if db.Type() != lua.LTTable {
+		return false
+	}
+	return db.(*lua.LTable).RawGetString("sim_opt_in") == lua.LTrue
 }
 
 // parseOptOutRequest reads VoidScoutDB.opt_out_requested from any
@@ -1249,6 +1272,12 @@ func rawField(t *lua.LTable, key string) map[string]interface{} {
 			out[ks] = string(val.(lua.LString))
 		case lua.LTBool:
 			out[ks] = bool(val.(lua.LBool))
+		case lua.LTTable:
+			// The damage-sim snapshot (only written after /vs sim on) is the one nested
+			// table that goes up; other nested tables stay local as before.
+			if ks == "sim" {
+				out[ks] = luaTableToInterface(val.(*lua.LTable))
+			}
 		}
 	})
 	return out
@@ -2238,6 +2267,11 @@ func postCombatLogBytes(apiBase, filename string, fileBytes []byte, playerName, 
 	}
 	if err := mw.WriteField("region", playerRegion); err != nil {
 		return 0, err
+	}
+	if simOptIn.Load() {
+		if err := mw.WriteField("sim", "1"); err != nil {
+			return 0, err
+		}
 	}
 	part, err := mw.CreateFormFile("file", filename)
 	if err != nil {
