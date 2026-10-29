@@ -1114,6 +1114,9 @@ func doFileShared(L *lua.LState, path string) error {
 	if err != nil {
 		return err
 	}
+	if loadSavedVarsData(L, data) == nil { // linear-time; compiling as Lua is O(n^2)
+		return nil
+	}
 	fn, err := L.Load(bytes.NewReader(data), path)
 	if err != nil {
 		return err
