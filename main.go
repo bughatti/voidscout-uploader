@@ -2196,6 +2196,10 @@ func uploadCombatLogChunkedAfter(apiBase, path, playerName, playerRealm, playerR
 		return 0, fmt.Errorf("read: %w", err)
 	}
 	chunks := extractEncounterChunksAfter(fileBytes, after)
+	if simOptIn.Load() {
+		// Damage-sim sharing also sends Mythic+ trash between the bosses.
+		chunks = append(chunks, extractTrashChunksAfter(fileBytes, after)...)
+	}
 	if len(chunks) == 0 {
 		return 422, fmt.Errorf("no encounters found in file (was /combatlog on?)")
 	}
@@ -2326,4 +2330,164 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// extractTrashChunksAfter cuts each Mythic+ run's trash into chunks for the damage sim:
+// key start → first boss, between bosses, last boss → key end. Every chunk carries the log
+// header, the last zone change, the run's CHALLENGE_MODE_START line and the run's
+// COMBATANT_INFO lines (WoW only logs those at boss pulls, so trash takes each player's
+// stats and gear from the run's bosses). Segments over the chunk limit are split at line
+// boundaries. Only segments that end past byte offset `after` are sent (new data).
+func extractTrashChunksAfter(fileBytes []byte, after int64) [][]byte {
+	headerEnd := bytes.IndexByte(fileBytes, '\n')
+	if headerEnd < 0 {
+		return nil
+	}
+	header := fileBytes[:headerEnd+1]
+
+	type segment struct{ start, end int }
+	var (
+		chunks    [][]byte
+		zone      []byte
+		keyStart  []byte
+		inKey     bool
+		inEnc     bool
+		segStart  = -1
+		segs      []segment
+		combatant = map[string][]byte{} // latest COMBATANT_INFO line per player GUID, this run
+	)
+	flush := func() {
+		if len(segs) == 0 {
+			return
+		}
+		var prefix []byte
+		prefix = append(prefix, header...)
+		prefix = append(prefix, zone...)
+		prefix = append(prefix, keyStart...)
+		for _, l := range combatant {
+			prefix = append(prefix, l...)
+		}
+		limit := int(combatLogMaxChunkBytes) - len(prefix)
+		for _, s := range segs {
+			if int64(s.end) <= after || !bytes.Contains(fileBytes[s.start:s.end], []byte("_DAMAGE,")) {
+				continue // already sent, or a sliver with no fighting in it (last boss → key end)
+			}
+			for p := s.start; p < s.end; {
+				q := s.end
+				if q-p > limit {
+					q = p + limit
+					if nl := bytes.LastIndexByte(fileBytes[p:q], '\n'); nl > 0 {
+						q = p + nl + 1
+					}
+				}
+				chunk := make([]byte, 0, len(prefix)+q-p)
+				chunk = append(chunk, prefix...)
+				chunk = append(chunk, fileBytes[p:q]...)
+				chunks = append(chunks, chunk)
+				p = q
+			}
+		}
+		segs = segs[:0]
+	}
+	closeSeg := func(at int) {
+		if segStart >= 0 && at > segStart {
+			segs = append(segs, segment{segStart, at})
+		}
+		segStart = -1
+	}
+
+	pos := headerEnd + 1
+	for pos < len(fileBytes) {
+		nl := bytes.IndexByte(fileBytes[pos:], '\n')
+		lineEnd := len(fileBytes)
+		if nl >= 0 {
+			lineEnd = pos + nl + 1
+		}
+		line := fileBytes[pos:lineEnd]
+		ev := line
+		if i := bytes.Index(line, []byte("  ")); i >= 0 {
+			ev = line[i+2:]
+		}
+		switch {
+		case bytes.HasPrefix(ev, []byte("ZONE_CHANGE,")):
+			zone = append(zone[:0], line...)
+		case bytes.HasPrefix(ev, []byte("CHALLENGE_MODE_START,")):
+			closeSeg(pos)
+			flush()
+			inKey, inEnc = true, false
+			keyStart = append(keyStart[:0], line...)
+			combatant = map[string][]byte{}
+			segStart = lineEnd
+		case bytes.HasPrefix(ev, []byte("CHALLENGE_MODE_END,")):
+			if inKey && !inEnc {
+				closeSeg(pos)
+			}
+			flush()
+			inKey, inEnc = false, false
+			keyStart = keyStart[:0]
+		case inKey && bytes.HasPrefix(ev, []byte("ENCOUNTER_START,")):
+			closeSeg(pos)
+			inEnc = true
+		case inKey && bytes.HasPrefix(ev, []byte("ENCOUNTER_END,")):
+			inEnc = false
+			segStart = lineEnd
+		case inKey && bytes.HasPrefix(ev, []byte("COMBATANT_INFO,")):
+			if g := bytes.SplitN(ev, []byte(","), 3); len(g) >= 2 {
+				combatant[string(g[1])] = append([]byte(nil), line...)
+			}
+		}
+		pos = lineEnd
+		if nl < 0 {
+			break
+		}
+	}
+	if inKey && !inEnc {
+		closeSeg(len(fileBytes)) // a run that was left without CHALLENGE_MODE_END
+	}
+	flush()
+	return chunks
+}
+
+// splitAtLull picks where to cut an oversize trash segment in [p, end): just after the last
+// line followed by 6+ seconds of nothing (the server ends a pull after 5 s without damage,
+// so a cut there never splits a pull). Without such a lull, the last line break.
+func splitAtLull(b []byte, p, end int) int {
+	clock := func(line []byte) (float64, bool) {
+		// "MM/DD/YYYY HH:MM:SS.mmm-N  ..."
+		sp := bytes.IndexByte(line, ' ')
+		if sp < 0 || len(line) < sp+13 {
+			return 0, false
+		}
+		t := line[sp+1 : sp+13]
+		h, m := int(t[0]-'0')*10+int(t[1]-'0'), int(t[3]-'0')*10+int(t[4]-'0')
+		s, err := strconv.ParseFloat(string(t[6:12]), 64)
+		if err != nil {
+			return 0, false
+		}
+		return float64(h*3600+m*60) + s, true
+	}
+	best, lastNL := -1, -1
+	prevEnd, prevT, have := -1, 0.0, false
+	for pos := p; pos < end; {
+		nl := bytes.IndexByte(b[pos:end], '\n')
+		if nl < 0 {
+			break
+		}
+		lineEnd := pos + nl + 1
+		if t, ok := clock(b[pos:lineEnd]); ok {
+			if have && t-prevT >= 6 {
+				best = prevEnd
+			}
+			prevT, have = t, true
+		}
+		prevEnd, lastNL = lineEnd, lineEnd
+		pos = lineEnd
+	}
+	if best > p {
+		return best
+	}
+	if lastNL > p {
+		return lastNL
+	}
+	return end
 }

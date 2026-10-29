@@ -40,3 +40,53 @@ func TestChunksAfterKeepsStraddlingEncounter(t *testing.T) {
 		t.Fatalf("straddling encounter: got %d chunks, want 2", len(got))
 	}
 }
+
+// A key: trash, boss (with COMBATANT_INFO), trash, key end. Trash comes out as two chunks,
+// each led by the header, the key start and the run's COMBATANT_INFO, and none of the
+// boss's own lines.
+func TestTrashChunks(t *testing.T) {
+	var b bytes.Buffer
+	b.WriteString("10/22/2026 00:00:00.000-6  COMBAT_LOG_VERSION,22\n")
+	b.WriteString("10/22/2026 00:00:01.000-6  ZONE_CHANGE,2993,\"Altar of Fangs\",8\n")
+	b.WriteString("10/22/2026 00:01:00.000-6  CHALLENGE_MODE_START,\"Altar of Fangs\",2993,555,7,[9]\n")
+	b.WriteString("10/22/2026 00:01:05.000-6  SPELL_DAMAGE,trash1\n")
+	b.WriteString("10/22/2026 00:02:00.000-6  ENCOUNTER_START,3456,\"Rav'i\",8,5,2993\n")
+	b.WriteString("10/22/2026 00:02:00.100-6  COMBATANT_INFO,Player-1-AAAA,0,1,2,3\n")
+	b.WriteString("10/22/2026 00:02:05.000-6  SPELL_DAMAGE,bosshit\n")
+	b.WriteString("10/22/2026 00:03:00.000-6  ENCOUNTER_END,3456,\"Rav'i\",8,5,1,60000\n")
+	b.WriteString("10/22/2026 00:03:10.000-6  SPELL_DAMAGE,trash2\n")
+	b.WriteString("10/22/2026 00:04:00.000-6  CHALLENGE_MODE_END,2993,1,7,180000\n")
+	got := extractTrashChunksAfter(b.Bytes(), 0)
+	if len(got) != 2 {
+		t.Fatalf("got %d trash chunks, want 2", len(got))
+	}
+	for i, c := range got {
+		for _, want := range []string{"COMBAT_LOG_VERSION", "CHALLENGE_MODE_START", "COMBATANT_INFO,Player-1-AAAA"} {
+			if !bytes.Contains(c, []byte(want)) {
+				t.Fatalf("chunk %d lacks %s:\n%s", i, want, c)
+			}
+		}
+		if bytes.Contains(c, []byte("bosshit")) || bytes.Contains(c, []byte("ENCOUNTER_START")) {
+			t.Fatalf("chunk %d has boss lines:\n%s", i, c)
+		}
+	}
+	if !bytes.Contains(got[0], []byte("trash1")) || !bytes.Contains(got[1], []byte("trash2")) {
+		t.Fatal("trash lines in the wrong chunks")
+	}
+	if n := len(extractTrashChunksAfter(b.Bytes(), int64(b.Len()))); n != 0 {
+		t.Fatalf("already-sent log: got %d chunks, want 0", n)
+	}
+}
+
+// An oversize trash segment is cut after the line before a 6+ s lull, not mid-pull.
+func TestSplitAtLull(t *testing.T) {
+	var b bytes.Buffer
+	for _, ts := range []string{"10:00:00.000", "10:00:01.000", "10:00:02.000", "10:00:10.000", "10:00:11.000"} {
+		b.WriteString("10/22/2026 " + ts + "-6  SPELL_DAMAGE,x\n")
+	}
+	data := b.Bytes()
+	cut := splitAtLull(data, 0, len(data))
+	if !bytes.HasSuffix(data[:cut], []byte("10:00:02.000-6  SPELL_DAMAGE,x\n")) {
+		t.Fatalf("cut after %q, want after the 10:00:02 line", data[:cut])
+	}
+}
