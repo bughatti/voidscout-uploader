@@ -1,6 +1,6 @@
 # VoidScout Uploader
 
-Companion app for the [VoidScout](https://voidscout.io) WoW addon. Watches your `SavedVariables/VoidScout.lua` file and uploads new fight scores to api.voidscout.io.
+Companion app for the [VoidScout](https://voidscout.io) WoW addon. WoW addons can't make web requests, so the uploader watches the addon's saved data and your combat log, and uploads the fights you've chosen to share to api.voidscout.io.
 
 **Single binary. ~6 MB. Zero install dependencies.**
 
@@ -19,9 +19,9 @@ Companion app for the [VoidScout](https://voidscout.io) WoW addon. Watches your 
 3. **Run it** — double-click on Windows, or `./voidscout-uploader-darwin-*` in terminal on Mac/Linux
 
 The uploader will:
-- Auto-detect your WoW SavedVariables folder
+- Auto-detect your WoW SavedVariables and Logs folders
 - Watch `VoidScout.lua` for changes (5s polling)
-- Upload any new fight scores to api.voidscout.io
+- Upload new fights while uploads are allowed in VoidScout (nothing at all in local-only mode)
 - Auto-update itself when new versions ship
 
 ## What about Windows SmartScreen warning?
@@ -44,19 +44,19 @@ Flags:
 
 ## What gets uploaded?
 
-Only the fight data from `VoidScout.lua` SavedVariables. That's:
-- Encounter ID, name, difficulty
-- Fight outcome (kill/wipe), duration, timestamp
-- Roster (player names in the pull)
-- Per-player 8-axis scores (Damage / Interrupts / Dispels / Avoidance / Activity / Survival / Teamwork)
+Nothing until you choose **Allow uploads** in VoidScout's consent dialog (right-click the minimap button to change it). Then:
+- **Fight summaries** from `VoidScout.lua`: encounter, difficulty, outcome, duration, the roster (player names in the pull) and per-player 8-axis scores (Damage / Interrupts / Dispels / Avoidance / Activity / Survival / Teamwork)
+- **Player profiles** the addon recorded (names, realms, classes, gear of players you grouped with or inspected)
+- **Your combat log** (`Logs/WoWCombatLog-*.txt`), one piece per boss fight and per Mythic+ trash section, so the fights can be scored
+- With **damage-sim sharing** on (optional, off by default): the same combat-log pieces are marked for the voidscout.io damage simulator, which stores players under anonymous IDs
 
-**Not uploaded:** chat messages, your personal info, account credentials, anything outside this single file.
+**Not uploaded:** chat messages, account credentials, bags, or any other files. Switching VoidScout to local-only stops all uploads.
 
 ## Privacy
 
-VoidScout follows the same opt-out model as RaiderIO and WarcraftLogs — character names are public (pseudonymous WoW identifiers), with an opt-out mechanism at voidscout.io for any player who wants their data removed.
+VoidScout follows the same opt-out model as RaiderIO and WarcraftLogs — character names are public (pseudonymous WoW identifiers), with an opt-out mechanism at voidscout.io for any player who wants their data removed. "Delete + go local" in the addon sends that request for you.
 
-See [PRIVACY.md](https://voidscout.io/privacy) for full details.
+See the [privacy policy](https://voidscout.io/privacy) for full details, and [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md) for exactly what the uploader connects to. Questions: support@voidscout.io
 
 ## How it auto-updates
 

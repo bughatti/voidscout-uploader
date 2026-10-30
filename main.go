@@ -846,8 +846,17 @@ func runOnce(svPath, apiBase string, state *State, statePath string, dryRun, ver
 		}
 	}
 
-	// Damage-sim sharing (/vs sim on in the addon): combat-log uploads then carry sim=1.
-	simOptIn.Store(readSimOptIn(svPath))
+	// The addon's consent, read fresh each pass: uploads stop as soon as the player
+	// switches to local-only; damage-sim sharing makes combat-log uploads carry sim=1.
+	allowed, sim := readConsent(svPath)
+	uploadAllowed.Store(allowed)
+	simOptIn.Store(sim)
+	if !allowed {
+		if verbose {
+			log.Printf("uploads are off in VoidScout (local-only or no choice yet): nothing sent")
+		}
+		return
+	}
 
 	fights, contributor, err := parseSavedVars(svPath)
 	if err != nil {
@@ -992,23 +1001,36 @@ type OptOutRequest struct {
 	Source      string
 }
 
-// simOptIn mirrors VoidScoutDB.sim_opt_in (the addon's /vs sim on): when set, combat-log
-// uploads ask the server to keep the sim detail (sim=1). Re-read on every SavedVariables
-// change.
-var simOptIn atomic.Bool
+// uploadAllowed mirrors the addon's upload consent (VoidScoutDB.consent: "Allow uploads"
+// chosen, on a consent version that's still current). Fights, player profiles and combat
+// logs upload only while it's set, so switching VoidScout to local-only stops them at once.
+// simOptIn mirrors VoidScoutDB.sim_opt_in (damage-sim sharing): when set, combat-log
+// uploads ask the server to keep the sim detail (sim=1). Both are re-read on every
+// SavedVariables change.
+var uploadAllowed, simOptIn atomic.Bool
 
-// readSimOptIn reports whether VoidScoutDB.sim_opt_in is true in the SavedVariables file.
-func readSimOptIn(path string) bool {
+// consentMinVersion matches the addon's REPROMPT_BELOW (ConsentDialog.lua): an older
+// choice is asked again, so it doesn't count.
+const consentMinVersion = 2
+
+// readConsent reads the addon's upload consent and damage-sim choice from the
+// SavedVariables file. A missing or unreadable file allows nothing.
+func readConsent(path string) (allowed, sim bool) {
 	L := lua.NewState()
 	defer L.Close()
 	if err := doFileShared(L, path); err != nil {
-		return false
+		return false, false
 	}
 	db := L.GetGlobal("VoidScoutDB")
 	if db.Type() != lua.LTTable {
-		return false
+		return false, false
 	}
-	return db.(*lua.LTable).RawGetString("sim_opt_in") == lua.LTrue
+	t := db.(*lua.LTable)
+	if c, ok := t.RawGetString("consent").(*lua.LTable); ok {
+		v, _ := c.RawGetString("version").(lua.LNumber)
+		allowed = c.RawGetString("choice") == lua.LString("allowed") && int(v) >= consentMinVersion
+	}
+	return allowed, allowed && t.RawGetString("sim_opt_in") == lua.LTrue
 }
 
 // parseOptOutRequest reads VoidScoutDB.opt_out_requested from any
@@ -1452,7 +1474,9 @@ func runProfileLoop(svPath, apiBase string, dryRun, verbose bool) {
 
 	lastUploadedLastSeen := make(map[string]int64) // slug → last_seen we pushed
 	for {
-		runProfileBatch(svPath, apiBase, lastUploadedLastSeen, dryRun, verbose)
+		if uploadAllowed.Load() { // off while VoidScout is local-only
+			runProfileBatch(svPath, apiBase, lastUploadedLastSeen, dryRun, verbose)
+		}
 		time.Sleep(profileLoopInterval)
 	}
 }
@@ -1966,6 +1990,12 @@ func extractEncounterChunksAfter(fileBytes []byte, after int64) [][]byte {
 // and POSTs each one to /api/upload-log. State is persisted after each
 // successful upload so we never re-send.
 func scanCombatLogs(apiBase string, state *State, statePath string, dryRun, verbose bool) {
+	if !uploadAllowed.Load() {
+		if verbose {
+			log.Printf("combatlog: uploads are off in VoidScout, skipping scan")
+		}
+		return
+	}
 	if state.Contributor == "" {
 		if verbose {
 			log.Printf("combatlog: no Contributor yet, skipping scan")
