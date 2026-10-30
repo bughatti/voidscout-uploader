@@ -25,6 +25,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # actions: read lets SignPath fetch the unsigned Windows artifact from this run.
+    permissions:
+      contents: read
+      actions: read
     strategy:
       matrix:
         include:
@@ -61,9 +65,36 @@ jobs:
           ls -lh "$OUT"
 
       - uses: actions/upload-artifact@v4
+        id: upload
         with:
           name: voidscout-uploader-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/voidscout-uploader-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+
+      # Windows only: SignPath signs the binary this run built (certificate by SignPath
+      # Foundation, see CODE_SIGNING_POLICY.md), and the signed one replaces the unsigned
+      # artifact before the release job publishes it. Skipped until the SignPath project
+      # is set up (repository variables SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG,
+      # SIGNPATH_SIGNING_POLICY_SLUG and the secret SIGNPATH_API_TOKEN). Pinned to the
+      # commit of SignPath's v2 release.
+      - name: Sign (SignPath)
+        if: matrix.goos == 'windows' && vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Replace the artifact with the signed binary
+        if: matrix.goos == 'windows' && vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: voidscout-uploader-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: signed/voidscout-uploader-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          overwrite: true
 
   release:
     needs: build
