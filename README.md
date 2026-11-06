@@ -22,6 +22,7 @@ The uploader will:
 - Auto-detect your WoW SavedVariables and Logs folders
 - Watch `VoidScout.lua` for changes (5s polling)
 - Upload new fights while uploads are allowed in VoidScout (nothing at all in local-only mode)
+- If you also play **WoW Forever**, upload your Forever fights too (only fights, and only if you allowed uploads in Forever's VoidScout). They're kept apart from retail and never count toward retail scores.
 - Auto-update itself when new versions ship
 
 ## What about Windows SmartScreen warning?
