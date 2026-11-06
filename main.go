@@ -51,7 +51,7 @@ const (
 	updateRepo          = "bughatti/voidscout-uploader" // public GitHub repo for releases
 	updateCheckTimeout  = 10 * time.Second
 	updateCheckInterval = 6 * time.Hour // re-check while running, not only at launch
-	currentVersion      = "0.4.6"       // bumped on each release; compared to GitHub
+	currentVersion      = "0.4.7"       // bumped on each release; compared to GitHub
 
 	// Combat log scan cadence — the addon auto-toggles /combatlog on
 	// encounter/run boundaries, so files appear and stabilize at that
@@ -776,14 +776,26 @@ func main() {
 
 	// One-shot mode for testing
 	if *oncePath != "" {
-		runOnce(*oncePath, *apiBase, state, statePath, *dryRun, *verbose)
+		if isForeverPath(*oncePath) {
+			runForeverOnce(*oncePath, *apiBase, *dryRun, *verbose)
+		} else {
+			runOnce(*oncePath, *apiBase, state, statePath, *dryRun, *verbose)
+		}
 		return
 	}
+
+	// WoW Forever fights: their own loop, file and endpoint (forever.go).
+	go runForeverLoop(*apiBase, *dryRun, *verbose)
 
 	// Auto-detect file
 	svPath, err := detectSavedVariablesPath()
 	if err != nil {
-		log.Fatalf("Could not find VoidScout SavedVariables: %v", err)
+		if detectForeverSavedVariablesPath() == "" {
+			log.Fatalf("Could not find VoidScout SavedVariables: %v", err)
+		}
+		// Forever only (no retail VoidScout yet): the Forever loop above does the work.
+		log.Printf("No retail VoidScout SavedVariables (%v); uploading WoW Forever fights only", err)
+		select {}
 	}
 	log.Printf("Watching: %s", svPath)
 
@@ -953,8 +965,20 @@ func wowAccountRoots() []string {
 	return roots
 }
 
-// wowInstallPaths returns common WoW _retail_ install locations per OS.
+// wowInstallPaths returns the common WoW _retail_ install locations per OS that exist.
+// Retail only: Forever is found separately (forever.go) and never mixed in here.
 func wowInstallPaths() []string {
+	var existing []string
+	for _, p := range allRetailCandidates() {
+		if st, err := os.Stat(p); err == nil && st.IsDir() {
+			existing = append(existing, p)
+		}
+	}
+	return existing
+}
+
+// allRetailCandidates lists the places a _retail_ install usually is, existing or not.
+func allRetailCandidates() []string {
 	var paths []string
 	switch runtime.GOOS {
 	case "windows":
@@ -976,13 +1000,7 @@ func wowInstallPaths() []string {
 			filepath.Join(home, "Games", "world-of-warcraft", "drive_c", "Program Files (x86)", "World of Warcraft", "_retail_"),
 		}
 	}
-	var existing []string
-	for _, p := range paths {
-		if st, err := os.Stat(p); err == nil && st.IsDir() {
-			existing = append(existing, p)
-		}
-	}
-	return existing
+	return paths
 }
 
 // ---- parsing ----
@@ -1363,12 +1381,17 @@ func parseFullName(full string) (name, realm, region string) {
 // ---- HTTP upload ----
 
 func uploadBatch(apiBase, contributor string, batch []IngestFight) (*IngestResponse, error) {
+	return uploadBatchTo(apiBase, "/api/ingest/fight", contributor, batch)
+}
+
+// uploadBatchTo posts a batch of fights to an ingest endpoint (retail or Forever).
+func uploadBatchTo(apiBase, endpoint, contributor string, batch []IngestFight) (*IngestResponse, error) {
 	payload := IngestPayload{Contributor: contributor, Fights: batch}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest("POST", apiBase+"/api/ingest/fight", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", apiBase+endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
